@@ -31,14 +31,17 @@ def setup_ca(log) -> None:
     FOUNDER_DIR.mkdir(parents=True, exist_ok=True)
     if FOUNDER_PRIVATE.exists():
         private_key = load_private_key(FOUNDER_PRIVATE)
-        log.info("founder CA key already exists; reusing it")
+        log.info("founder CA key already exists; not overwriting it")
     else:
-        private_key, pem = generate_p256_keypair()
+        private_key, _ = generate_p256_keypair()
         save_private_key(FOUNDER_PRIVATE, private_key)
-        FOUNDER_PUBLIC.write_text(pem, encoding="ascii")
-        log.info("founder CA key created; public key written to %s", FOUNDER_PUBLIC)
-    if not FOUNDER_PUBLIC.exists():
-        FOUNDER_PUBLIC.write_text(public_key_pem(private_key), encoding="ascii")
+        log.info("founder CA key created")
+
+    # Always re-derive the public key from the real private key, so a stale or
+    # corrupted founder.pub is repaired and everyone verifies against the
+    # correct CA key. The private key itself is never regenerated here.
+    FOUNDER_PUBLIC.write_text(public_key_pem(private_key), encoding="ascii")
+    log.info("founder public key written to %s", FOUNDER_PUBLIC)
     log.info("founder public key prefix %s", public_key_pem(private_key).splitlines()[1][:8])
 
 
@@ -59,7 +62,10 @@ def sign_certificates(log) -> None:
         if request["name"] != name:
             raise ValueError(f"public-key request name {request['name']!r} != expected {name!r}")
         public_key_pem_text = request["public_key"]
-        load_public_key(public_key_pem_text)  # reject malformed/non-P-256 keys early
+        try:
+            load_public_key(public_key_pem_text)  # reject malformed/non-P-256 keys early
+        except ValueError as exc:
+            raise ValueError(f"invalid public key in request {request_path.name}") from exc
 
         certificate = create_certificate(
             founder_private_key, name, public_key_pem_text, CERT_EXPIRY
@@ -88,10 +94,13 @@ def main() -> None:
 
     if not args.init and not args.sign_certs:
         args.init = args.sign_certs = True
-    if args.init:
-        setup_ca(log)
-    if args.sign_certs:
-        sign_certificates(log)
+    try:
+        if args.init:
+            setup_ca(log)
+        if args.sign_certs:
+            sign_certificates(log)
+    except ValueError as exc:
+        parser.error(str(exc))
     log.info("setup complete for t=%d, n=%d", args.t, args.n)
 
 

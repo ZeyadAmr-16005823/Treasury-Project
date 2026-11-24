@@ -7,7 +7,12 @@ from unittest.mock import Mock, patch
 from treasury import founder
 from treasury.certificates import verify_certificate
 from treasury.config import CERT_EXPIRY, GROUP, PROGRAM_NAMES
-from treasury.crypto_utils import generate_p256_keypair, load_public_key, public_key_pem
+from treasury.crypto_utils import (
+    generate_p256_keypair,
+    load_private_key,
+    load_public_key,
+    public_key_pem,
+)
 
 
 class FounderSetupTests(unittest.TestCase):
@@ -56,6 +61,28 @@ class FounderSetupTests(unittest.TestCase):
         founder.setup_ca(self.log)
         founder.sign_certificates(self.log)
         self.assertEqual(sorted(p.stem for p in founder.CERTS_DIR.glob("*.json")), ["M1"])
+
+    def test_init_repairs_stale_public_key_without_replacing_private_key(self):
+        founder.setup_ca(self.log)
+        private_bytes = founder.FOUNDER_PRIVATE.read_bytes()
+        _, stale_pem = generate_p256_keypair()
+        founder.FOUNDER_PUBLIC.write_text(stale_pem, encoding="ascii")
+
+        founder.setup_ca(self.log)
+
+        self.assertEqual(founder.FOUNDER_PRIVATE.read_bytes(), private_bytes)
+        expected = public_key_pem(load_private_key(founder.FOUNDER_PRIVATE))
+        self.assertEqual(founder.FOUNDER_PUBLIC.read_text(encoding="ascii"), expected)
+
+    def test_invalid_public_key_request_fails_cleanly(self):
+        founder.setup_ca(self.log)
+        self.write_request("M1")
+        path = founder.REQUESTS_DIR / "M1.json"
+        request = json.loads(path.read_text(encoding="utf-8"))
+        request["public_key"] = "not a PEM key"
+        path.write_text(json.dumps(request), encoding="utf-8")
+        with self.assertRaises(ValueError):
+            founder.sign_certificates(self.log)
 
     def test_signing_requires_ca_key(self):
         with self.assertRaises(RuntimeError):
