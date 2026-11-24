@@ -61,7 +61,12 @@ verify_share(share: int, member_index: int, commitments: list[int], p: int, q: i
 lagrange_coefficient(i: int, selected_indices: list[int], q: int) -> int
 ```
 
-- Polynomial: `f(x) = a₀ + a₁x + … + a_{t−1}x^{t−1} mod q`, `a₀ = s`, degree `t−1`.
+- Polynomial: `f(x) = a₀ + a₁x + … + a_{t−1}x^{t−1} mod q`, `a₀ = s`, degree **at most** `t−1`.
+  All coefficients are sampled from all of ℤ_q as the handout specifies. Consequently the highest
+  coefficient can be zero; then `C_{t−1} = 1` publicly reveals a lower-degree polynomial and the
+  effective threshold drops. Probability `1/q` is negligible for this group but nonzero. Ask the TA
+  whether to instead sample `a_{t−1}` from ℤ_q* to guarantee exact degree `t−1`. Do not silently
+  change the handout's rule; until clarified, describe the polynomial as "degree at most t−1".
 - `make_shares` returns `(coefficients, [f(1), …, f(n)])`; uses `secrets.randbelow(q)`, never `random`.
 - `verify_share`: validates index `1…n`, scalar range, commitment list length `t`, `C₀ != 1`, all
   commitments in subgroup (identity permitted for `k≥1`), then checks `g^{share} == ∏ C_k^{i^k} mod p`.
@@ -144,7 +149,10 @@ This tree is separate from M1 certificates and registrations.
 shares + signatures + vault decryption there, then **one** directory rename to `generation-NNN`,
 write `manifest.json` last (or rename a prebuilt complete directory), then atomically update
 `current.json`. Consumers ignore any generation without `manifest.json`. Never overwrite an
-existing completed generation; `--setup-vault` refuses if one exists unless explicitly forced.
+existing completed generation. Without `--force`, setup refuses if one exists; **with `--force`, a new
+immutable generation is created** (`generation-002`, etc.) and `current.json` is changed only after the
+new generation is complete and validated. Previous generations and their shares are never deleted or
+modified. An interrupted forced setup leaves the previous `current.json` pointer untouched.
 
 ## 8. Erasure
 
@@ -169,3 +177,12 @@ no partial publication on failure.
 
 The **joint** end-to-end test (after Members 2/3 integrate) is separate: founder → Member 3 proofs →
 Member 2 verification/combination → `m` → AES-GCM decryption of the original file.
+
+## 11. Contract status
+
+The code on `feature/m2-founder-sharing` implements this document, but the contract is **not yet fully
+agreed by the team**:
+- Member 3 must confirm the `w` nonce rule so `T₁`/`T₂` validation is frozen.
+- Member 4 must add the backward-compatible `is_subgroup_element()` helper to `group.py`.
+- Members 2 and 3 must approve the commitment digest, HKDF/AAD bytes, validation rules and paths.
+- The TA must confirm whether `a_{t−1}` may be zero (§4) before the sampling rule is frozen.

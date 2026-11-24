@@ -59,9 +59,13 @@ def evaluate_polynomial(coefficients: list[int], x: int, q: int) -> int:
 
 
 def make_shares(secret: int, t: int, n: int, q: int) -> tuple[list[int], list[int]]:
-    """Random degree-(t-1) polynomial with a0=secret; return coefficients and shares.
+    """Random polynomial of degree AT MOST t-1 with a0=secret; return coefficients and shares.
 
-    Polynomial coefficients a1…a(t-1) are drawn from all of ℤ_q, so zero is allowed.
+    All coefficients a1…a(t-1) are drawn from ℤ_q as the handout specifies, so a
+    zero highest coefficient is possible. With a published Feldman commitment
+    C_{t-1}=1 that would reveal the polynomial is linear and effectively reduce
+    the threshold; this negligible exception is documented in M2_INTERFACES.md
+    pending the TA's interpretation.
     """
     if not all(_is_int(v) for v in (secret, t, n, q)):
         raise ValueError("secret, t, n and q must be integers")
