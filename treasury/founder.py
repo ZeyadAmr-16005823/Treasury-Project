@@ -52,9 +52,13 @@ GENERATIONS_DIR = M2_DIR / "generations"
 CURRENT_FILE = M2_DIR / "current.json"
 
 
-def member_share_path(name: str):
-    """Private share file owned by one member; no other program reads it."""
-    return DATA_DIR / name / "share.json"
+def member_share_path(name: str, generation: str):
+    """Versioned private share file: a member reads only its active generation."""
+    return DATA_DIR / name / "m2" / "generations" / generation / "share.json"
+
+
+def member_share_staging_path(name: str, generation: str):
+    return DATA_DIR / name / "m2" / "generations" / f"{generation}.tmp"
 VAULT_VERSION = 1
 VAULT_PLAINTEXT = b"Treasury vault: the club's treasure is protected by 3-of-5 shares.\n"
 
@@ -179,24 +183,35 @@ def _next_generation(force: bool) -> tuple[str, object, object]:
     return name, final, staging
 
 
-def _publish_shares(generation: str, shares: list[int]) -> None:
-    """Hand each share to its member's own private directory, one file per member.
+def _stage_shares(generation: str, shares: list[int]) -> None:
+    """Stage each share in its member's versioned temp directory.
 
-    No program should open another member's share file. The ``generation`` field
-    lets a member ignore a share that does not match the published generation.
+    Nothing visible to the active generation is modified here, so an interruption
+    cannot make the current generation's shares unusable.
     """
-    staged = []
     for index, share in enumerate(shares, start=1):
-        path = member_share_path(f"M{index}")
-        next_path = path.with_name(path.name + ".next")
-        _write_json(next_path, {
+        staging_dir = member_share_staging_path(f"M{index}", generation)
+        if staging_dir.exists():
+            shutil.rmtree(staging_dir)
+        _write_json(staging_dir / "share.json", {
             "index": index,
             "generation": generation,
             "s_i": hex_element(share),
         }, private=True)
-        staged.append((next_path, path))
-    for next_path, path in staged:
-        os.replace(next_path, path)
+
+
+def _activate_shares(generation: str, n: int) -> None:
+    """Activate all staged member share directories in one pass.
+
+    Previous generations are never modified. If this is interrupted, the current
+    pointer still selects the old generation with its intact shares.
+    """
+    for index in range(1, n + 1):
+        staging_dir = member_share_staging_path(f"M{index}", generation)
+        final_dir = member_share_path(f"M{index}", generation).parent
+        if not staging_dir.exists():
+            raise RuntimeError(f"missing staged share directory for M{index}")
+        os.replace(staging_dir, final_dir)
 
 
 def setup_vault(log, t: int = DEFAULT_T, n: int = DEFAULT_N, force: bool = False) -> None:
@@ -244,6 +259,7 @@ def setup_vault(log, t: int = DEFAULT_T, n: int = DEFAULT_N, force: bool = False
     vault_sig = sign_raw(founder_private_key, canonical_json(vault_fields))
 
     generation, final, staging = _next_generation(force)
+    published = False
     try:
         public_dir = staging / "public"
         public_dir.mkdir(parents=True, exist_ok=True)
@@ -255,6 +271,7 @@ def setup_vault(log, t: int = DEFAULT_T, n: int = DEFAULT_N, force: bool = False
         })
         _write_json(public_dir / "vault.json", {**vault_fields, "sig": vault_sig})
         (public_dir / "vault.enc").write_bytes(frame)
+        _stage_shares(generation, shares)  # versioned temp dirs; active shares untouched
 
         # Validate the whole generation before publishing it.
         selected = list(range(1, t + 1))
@@ -277,11 +294,24 @@ def setup_vault(log, t: int = DEFAULT_T, n: int = DEFAULT_N, force: bool = False
         })
 
         os.replace(staging, final)
+        published = True
     finally:
         if staging.exists():
             shutil.rmtree(staging)
+        if not published:
+            for index in range(1, n + 1):
+                leftover = member_share_staging_path(f"M{index}", generation)
+                if leftover.exists():
+                    shutil.rmtree(leftover)
 
-    _publish_shares(generation, shares)
+    try:
+        _activate_shares(generation, n)
+    except Exception:
+        for index in range(1, n + 1):
+            leftover = member_share_staging_path(f"M{index}", generation)
+            if leftover.exists():
+                shutil.rmtree(leftover)
+        raise
     _write_json(CURRENT_FILE, {
         "generation": generation, "group": GROUP, "t": t, "n": n,
         "commitments_digest": D_C,
