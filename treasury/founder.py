@@ -7,6 +7,8 @@ signed certificates that everyone can verify with founder.pub.
 """
 import argparse
 import json
+import os
+import shutil
 
 from .certificates import create_certificate
 from .config import CERT_EXPIRY, DATA_DIR, GROUP, PROGRAM_NAMES, validate_group
@@ -45,17 +47,32 @@ def setup_ca(log) -> None:
     log.info("founder public key prefix %s", public_key_pem(private_key).splitlines()[1][:8])
 
 
-def sign_certificates(log) -> None:
-    """Sign one certificate per available public-key request."""
+def sign_certificates(log, allow_partial: bool = False) -> None:
+    """Validate all requests, then stage and activate a complete certificate set.
+
+    Normal setup is fail-closed: all six requests must be present and valid before
+    anything is written. ``allow_partial`` is restricted to tests/demos.
+    """
     if not FOUNDER_PRIVATE.exists():
         raise RuntimeError("founder CA key is missing; run with --init first")
     founder_private_key = load_private_key(FOUNDER_PRIVATE)
-    CERTS_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Pass 1a — locate every expected request before touching the active certs.
+    selected, missing = [], []
     for name in PROGRAM_NAMES:
         request_path = REQUESTS_DIR / f"{name}.json"
-        if not request_path.exists():
-            log.warning("no public-key request found for %s; skipping", name)
-            continue
+        if request_path.exists():
+            selected.append((name, request_path))
+        else:
+            missing.append(name)
+    if missing and not allow_partial:
+        raise ValueError("missing public-key requests: " + ", ".join(missing))
+    if missing:
+        log.warning("partial issuance (test-only); missing requests: %s", ", ".join(missing))
+
+    # Pass 1b — validate every selected request, building certificates in memory.
+    prepared = []
+    for name, request_path in selected:
         request = json.loads(request_path.read_text(encoding="utf-8"))
         if not isinstance(request, dict) or set(request) != {"name", "public_key"}:
             raise ValueError(f"invalid public-key request for {name}")
@@ -63,20 +80,45 @@ def sign_certificates(log) -> None:
             raise ValueError(f"public-key request name {request['name']!r} != expected {name!r}")
         public_key_pem_text = request["public_key"]
         try:
-            load_public_key(public_key_pem_text)  # reject malformed/non-P-256 keys early
+            load_public_key(public_key_pem_text)  # P-256 only, malformed PEM rejected
         except ValueError as exc:
             raise ValueError(f"invalid public key in request {request_path.name}") from exc
-
-        certificate = create_certificate(
+        prepared.append((name, create_certificate(
             founder_private_key, name, public_key_pem_text, CERT_EXPIRY
-        )
-        cert_path = CERTS_DIR / f"{name}.json"
-        cert_path.write_text(json.dumps(certificate.to_dict(), indent=2, sort_keys=True) + "\n",
-                             encoding="utf-8")
-        log.info(
-            "certificate issued for %s: group %s, expires %s, sig %s...",
-            name, GROUP, CERT_EXPIRY, certificate.sig[:8],
-        )
+        )))
+
+    # Pass 2 — stage the complete set, then activate it in one swap. A failure
+    # cannot leave a partial set or make stale certificates look newly issued.
+    staging = CERTS_DIR.parent / "certs.staging"
+    backup = CERTS_DIR.parent / "certs.backup"
+    for directory in (staging, backup):
+        if directory.exists():
+            shutil.rmtree(directory)
+    staging.mkdir(parents=True, exist_ok=True)
+    try:
+        for name, certificate in prepared:
+            (staging / f"{name}.json").write_text(
+                json.dumps(certificate.to_dict(), indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            log.info(
+                "certificate issued for %s: group %s, expires %s, sig %s...",
+                name, GROUP, CERT_EXPIRY, certificate.sig[:8],
+            )
+        if CERTS_DIR.exists():
+            CERTS_DIR.rename(backup)
+        try:
+            os.replace(staging, CERTS_DIR)
+        except OSError:
+            if backup.exists():
+                backup.rename(CERTS_DIR)
+            raise
+        if backup.exists():
+            shutil.rmtree(backup)
+    finally:
+        if staging.exists():
+            shutil.rmtree(staging)
+    log.info("activated %d certificate(s) in %s", len(prepared), CERTS_DIR)
 
 
 def main() -> None:
@@ -86,6 +128,8 @@ def main() -> None:
     parser.add_argument("--init", action="store_true", help="create the founder CA key")
     parser.add_argument("--sign-certs", action="store_true",
                         help="sign certificates from public-key request files")
+    parser.add_argument("--allow-partial", action="store_true",
+                        help="TEST ONLY: issue certificates from available requests")
     args = parser.parse_args()
     validate_group()
     log = get_logger("founder")
@@ -98,7 +142,7 @@ def main() -> None:
         if args.init:
             setup_ca(log)
         if args.sign_certs:
-            sign_certificates(log)
+            sign_certificates(log, allow_partial=args.allow_partial)
     except ValueError as exc:
         parser.error(str(exc))
     log.info("setup complete for t=%d, n=%d", args.t, args.n)

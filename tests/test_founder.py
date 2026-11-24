@@ -56,11 +56,63 @@ class FounderSetupTests(unittest.TestCase):
             self.assertEqual(cert["group"], GROUP)
             self.assertEqual(cert["expires"], CERT_EXPIRY)
 
-    def test_missing_requests_are_skipped(self):
-        self.write_request("M1")
+    def test_full_setup_leaves_no_staging_or_backup_directories(self):
+        for name in PROGRAM_NAMES:
+            self.write_request(name)
         founder.setup_ca(self.log)
         founder.sign_certificates(self.log)
+        parent = founder.CERTS_DIR.parent
+        self.assertFalse((parent / "certs.staging").exists())
+        self.assertFalse((parent / "certs.backup").exists())
+
+    def test_missing_requests_fail_closed(self):
+        self.write_request("M1")
+        founder.setup_ca(self.log)
+        founder.CERTS_DIR.mkdir(parents=True, exist_ok=True)
+        stale = founder.CERTS_DIR / "M4.json"
+        stale.write_text("stale certificate", encoding="utf-8")
+
+        with self.assertRaises(ValueError) as error:
+            founder.sign_certificates(self.log)
+
+        for name in PROGRAM_NAMES:
+            if name != "M1":
+                self.assertIn(name, str(error.exception))
+        # Nothing was activated: the stale certificate is untouched and no new
+        # certificate set was mistaken for a successful issuance.
+        self.assertEqual(stale.read_text(encoding="utf-8"), "stale certificate")
+        self.assertEqual(sorted(p.stem for p in founder.CERTS_DIR.glob("*.json")), ["M4"])
+
+    def test_allow_partial_replaces_stale_certificates(self):
+        founder.setup_ca(self.log)
+        self.write_request("M1")
+        founder.CERTS_DIR.mkdir(parents=True, exist_ok=True)
+        (founder.CERTS_DIR / "M4.json").write_text("stale certificate", encoding="utf-8")
+
+        founder.sign_certificates(self.log, allow_partial=True)
+
         self.assertEqual(sorted(p.stem for p in founder.CERTS_DIR.glob("*.json")), ["M1"])
+        self.assertFalse((founder.CERTS_DIR.parent / "certs.staging").exists())
+        self.assertFalse((founder.CERTS_DIR.parent / "certs.backup").exists())
+
+    def test_malformed_request_aborts_before_writing_any_certificate(self):
+        founder.setup_ca(self.log)
+        for name in PROGRAM_NAMES:
+            self.write_request(name)
+        founder.CERTS_DIR.mkdir(parents=True, exist_ok=True)
+        stale = founder.CERTS_DIR / "M5.json"
+        stale.write_text("stale certificate", encoding="utf-8")
+        bad_request = founder.REQUESTS_DIR / "M2.json"
+        request = json.loads(bad_request.read_text(encoding="utf-8"))
+        request["public_key"] = "not a PEM key"
+        bad_request.write_text(json.dumps(request), encoding="utf-8")
+
+        with self.assertRaises(ValueError) as error:
+            founder.sign_certificates(self.log)
+
+        self.assertIn("M2.json", str(error.exception))
+        self.assertEqual(stale.read_text(encoding="utf-8"), "stale certificate")
+        self.assertEqual(sorted(p.stem for p in founder.CERTS_DIR.glob("*.json")), ["M5"])
 
     def test_init_repairs_stale_public_key_without_replacing_private_key(self):
         founder.setup_ca(self.log)
@@ -73,16 +125,6 @@ class FounderSetupTests(unittest.TestCase):
         self.assertEqual(founder.FOUNDER_PRIVATE.read_bytes(), private_bytes)
         expected = public_key_pem(load_private_key(founder.FOUNDER_PRIVATE))
         self.assertEqual(founder.FOUNDER_PUBLIC.read_text(encoding="ascii"), expected)
-
-    def test_invalid_public_key_request_fails_cleanly(self):
-        founder.setup_ca(self.log)
-        self.write_request("M1")
-        path = founder.REQUESTS_DIR / "M1.json"
-        request = json.loads(path.read_text(encoding="utf-8"))
-        request["public_key"] = "not a PEM key"
-        path.write_text(json.dumps(request), encoding="utf-8")
-        with self.assertRaises(ValueError):
-            founder.sign_certificates(self.log)
 
     def test_signing_requires_ca_key(self):
         with self.assertRaises(RuntimeError):
