@@ -1,9 +1,13 @@
 """Shared, non-secret project configuration."""
 from pathlib import Path
 
-# TODO: Replace this with the numeric student IDs of the whole group,
-# sorted from smallest to largest and joined with hyphens.
-GROUP = "5-12-23"
+# Numeric student IDs of all four members, sorted and hyphen-joined.
+GROUP = "16005823-16006499-16009599-17005797"
+
+# Certificates are valid until this date (ISO YYYY-MM-DD). Live evaluation
+# happens after the 12 December 2026 deadline, so keep this safely in the
+# future; verification compares it with the current date.
+CERT_EXPIRY = "2030-12-31"
 
 HOST = "127.0.0.1"
 SERVER_PORT = 5050
@@ -18,10 +22,11 @@ DATA_DIR = Path("runtime") / "data"
 DEFAULT_T = 3
 DEFAULT_N = 5
 MEMBER_NAMES = tuple(f"M{i}" for i in range(1, DEFAULT_N + 1))
+PROGRAM_NAMES = ("server",) + MEMBER_NAMES
 
 WEAKNESS_NAMES = {
     "unsigned-handshake", "fixed-nonce", "short-challenge", "no-nonce",
-    "no-proof", "no-share-check", "unsigned-ballots",
+    "no-proof", "no-share-check", "unsigned-ballots", "no-encryption",
 }
 
 
