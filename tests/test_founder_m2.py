@@ -1,4 +1,5 @@
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -97,6 +98,40 @@ class FounderVaultTests(unittest.TestCase):
         self.assertEqual(current["generation"], "generation-002")
         self.assertTrue(generation.exists())
 
+    def test_forced_regeneration_preserves_previous_generation(self):
+        founder.setup_vault(self.log)
+        first_current, _ = self.current_generation()
+        first_manifest = (founder.GENERATIONS_DIR / "generation-001" / "manifest.json").read_text()
+        founder.setup_vault(self.log, force=True)
+        second_current, second = self.current_generation()
+        self.assertEqual(first_current["generation"], "generation-001")
+        self.assertEqual(second_current["generation"], "generation-002")
+        self.assertTrue(second.exists())
+        self.assertEqual(
+            (founder.GENERATIONS_DIR / "generation-001" / "manifest.json").read_text(),
+            first_manifest,
+        )
+
+    def test_interrupted_forced_regeneration_keeps_old_pointer(self):
+        founder.setup_vault(self.log)
+        before, _ = self.current_generation()
+        with patch.object(founder, "verify_share", return_value=False):
+            with self.assertRaises(RuntimeError):
+                founder.setup_vault(self.log, force=True)
+        after, _ = self.current_generation()
+        self.assertEqual(after, before)
+        self.assertFalse((founder.GENERATIONS_DIR / "generation-002").exists())
+        self.assertFalse((founder.GENERATIONS_DIR / "generation-002.tmp").exists())
+
+    def test_share_files_have_restrictive_permissions(self):
+        if os.name == "nt":
+            self.skipTest("POSIX permission bits are not meaningful on Windows")
+        founder.setup_vault(self.log)
+        _, generation = self.current_generation()
+        for index in range(1, 6):
+            mode = os.stat(generation / f"M{index}" / "share.json").st_mode & 0o777
+            self.assertEqual(mode, 0o600)
+
     def test_failed_validation_publishes_nothing(self):
         with patch.object(founder, "verify_share", return_value=False):
             with self.assertRaises(RuntimeError):
@@ -114,15 +149,31 @@ class FounderVaultTests(unittest.TestCase):
         self.assertEqual(len(commitments["commitments"]), 2)
 
     def test_no_secret_bearing_fields_are_persisted(self):
-        founder.setup_vault(self.log)
+        # Known founder scalar values let the test check for their persisted forms.
+        known_s, known_u, known_r = 12345, 23456, 34567
+        with patch.object(founder, "random_nonzero_scalar",
+                          side_effect=[known_s, known_u, known_r]):
+            founder.setup_vault(self.log)
         _, generation = self.current_generation()
+        vault = json.loads((generation / "public" / "vault.json").read_text())
+        m = pow(G, known_u, P)
+        key = vault_key(m, vault["c1"], vault["c2"], vault["commitments_digest"])
+        secret_forms = [
+            format(known_s, "x"), format(known_u, "x"), format(known_r, "x"),
+            format(m, "0512x"), key.hex(),
+        ]
         forbidden = {"s", "u", "r", "m", "key", "a0", "a1", "a2"}
         for path in generation.rglob("*.json"):
-            data = json.loads(path.read_text(encoding="utf-8"))
+            text = path.read_text(encoding="utf-8")
+            for form in secret_forms:
+                self.assertNotIn(form, text, f"{form[:8]}... appeared in {path.name}")
+            data = json.loads(text)
             if path.name == "share.json":
                 self.assertEqual(set(data), {"index", "s_i"})
             else:
                 self.assertFalse(forbidden.intersection(data))
+        frame = (generation / "public" / "vault.enc").read_bytes()
+        self.assertNotIn(founder.VAULT_PLAINTEXT, frame)
 
 
 if __name__ == "__main__":

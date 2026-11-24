@@ -83,6 +83,19 @@ class SharingTests(unittest.TestCase):
         zero_commitments = make_commitments(zero_share_poly, P, Q, G)
         self.assertTrue(verify_share(0, 1, zero_commitments, P, Q, G))
 
+    def test_zero_highest_coefficient_is_a_documented_exception(self):
+        secret = 321
+        coefficients = [secret, 999, 0]
+        commitments = make_commitments(coefficients, P, Q, G)
+        self.assertEqual(commitments[-1], 1)  # C_2 = g^0 = 1 is public evidence
+        shares = [evaluate_polynomial(coefficients, i, Q) for i in range(1, 6)]
+        for index, share in enumerate(shares, start=1):
+            self.assertTrue(verify_share(share, index, commitments, P, Q, G))
+        # With a linear polynomial, two shares already determine the secret.
+        subset = [1, 2]
+        recovered = sum(shares[i - 1] * lagrange_coefficient(i, subset, Q) for i in subset) % Q
+        self.assertEqual(recovered, secret)
+
     def test_verify_share_rejects_invalid_inputs(self):
         coefficients, shares = make_shares(777, 3, 5, Q)
         commitments = make_commitments(coefficients, P, Q, G)
