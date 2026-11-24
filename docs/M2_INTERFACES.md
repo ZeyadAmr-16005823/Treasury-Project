@@ -141,20 +141,20 @@ runtime/data/m2/
         manifest.json          # written LAST: generation id, t, n, D_C, artifact digests
   current.json                 # atomically updated pointer to the active generation
 
-runtime/data/M1/share.json     # private to M1, never read by another program
-runtime/data/M2/share.json
-runtime/data/M3/share.json
-runtime/data/M4/share.json
-runtime/data/M5/share.json
+runtime/data/M1/m2/generations/generation-001/share.json   # private to M1
+runtime/data/M2/m2/generations/generation-001/share.json
+... M3, M4, M5
 ```
 
-**Private-share handoff.** The founder generates all five shares but publishes **only public data**
-in the generation directory. Each share is written into the corresponding member's own private
-directory (`runtime/data/M<i>/share.json`), standing for an in-person handover.
+**Private-share handoff.** Shares are **versioned per generation** inside each member's own private
+tree. The founder generates all five shares but publishes only public data in the generation
+directory. Each share is staged in `runtime/data/M<i>/m2/generations/generation-NNN.tmp/share.json`,
+then activated by one directory rename. A member reads only
+`runtime/data/M<i>/m2/generations/<active generation>/share.json`.
 
 Ownership rules (enforced by application code, not just filesystem permissions):
 
-- `M1` reads only `runtime/data/M1/share.json`; `M2` only `runtime/data/M2/share.json`; and so on.
+- `M1` reads only its own `M1/m2/generations/.../share.json`; `M2` only its own; and so on.
   No member program opens another member's directory or share file.
 - The server and Mallory never read any private share file — they receive only public commitments,
   vault metadata and ciphertext, plus decryption shares produced over the secure channel.
@@ -165,17 +165,18 @@ Ownership rules (enforced by application code, not just filesystem permissions):
   they do **not** provide process isolation — the ownership boundary above is the real control.
 
 Each share file is `{"index": i, "generation": "generation-NNN", "s_i": "<512hex>"}`; a member uses
-it only when its `generation` matches `current.json`.
+it only when its directory generation matches `current.json`.
 
-**Atomic publication:** build the public artifacts in `generation-NNN.tmp` on the same filesystem,
-validate shares + signatures + vault decryption there, write `manifest.json` last, hand the shares
-to the member directories, then **one** directory rename to `generation-NNN`, and finally atomically
-update `current.json`. Consumers ignore any generation without `manifest.json` and any share whose
-`generation` differs from `current.json`. Never overwrite an existing completed generation.
-Without `--force`, setup refuses if one exists; **with `--force`, a new immutable generation is
-created** (`generation-002`, etc.) and `current.json` is changed only after the new generation is
-complete and validated. Previous generations are never deleted or modified; an interrupted forced
-setup leaves the previous `current.json` pointer untouched.
+**Atomic publication:** (1) build the public artifacts in `generation-NNN.tmp` on the same
+filesystem; (2) stage all five versioned member shares in `.../<generation>.tmp/`; (3) validate
+shares + signatures + vault decryption; (4) write `manifest.json` last and rename the public
+directory to `generation-NNN`; (5) atomically rename each staged member directory to `generation-NNN`;
+(6) **atomically update `current.json` last**. Consumers ignore any generation without
+`manifest.json`, and any member share whose generation differs from `current.json`. Never overwrite
+an existing completed generation. Without `--force`, setup refuses if one exists; **with `--force`, a
+new immutable generation is created** (`generation-002`, etc.; old share directories are untouched).
+An interrupted forced setup leaves `current.json` pointing at the previous generation with all five
+of its original shares intact.
 
 ## 8. Erasure
 
