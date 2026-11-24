@@ -1,25 +1,45 @@
-"""Founder setup: create the CA key and issue founder-signed certificates.
+"""Founder setup: CA certificates and Milestone 2 vault generation.
 
-The founder only ever handles its own CA private key and other programs'
-*public* key requests. Each program generates its own identity key and writes
-its own public request file; this module reads those requests and publishes the
-signed certificates that everyone can verify with founder.pub.
+M1: --init creates the CA key, --sign-certs issues founder-signed certificates.
+M2: --setup-vault generates Shamir shares, signed Feldman commitments and the
+encrypted vault, publishing a complete generation atomically.
+
+The founder never reads another program's private key. All founder-only secrets
+(s, polynomial coefficients, u, r, m and the derived key K) are used in memory
+only and are never written to disk or logged.
 """
 import argparse
 import json
 import os
+import secrets
 import shutil
 
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
 from .certificates import create_certificate
-from .config import CERT_EXPIRY, DATA_DIR, GROUP, PROGRAM_NAMES, validate_group
+from .config import (CERT_EXPIRY, DATA_DIR, DEFAULT_N, DEFAULT_T, GROUP,
+                     PROGRAM_NAMES, validate_group)
 from .crypto_utils import (
     generate_p256_keypair,
     load_private_key,
     load_public_key,
     public_key_pem,
     save_private_key,
+    sign_raw,
 )
+from .encoding import canonical_json, sha256
+from .group import G, P, Q
 from .logging_utils import get_logger
+from .sharing import (
+    hex_element,
+    lagrange_coefficient,
+    make_commitments,
+    make_shares,
+    random_nonzero_scalar,
+    vault_aad,
+    vault_key,
+    verify_share,
+)
 
 FOUNDER_DIR = DATA_DIR / "founder"
 FOUNDER_PRIVATE = FOUNDER_DIR / "founder_private.pem"
@@ -27,7 +47,14 @@ FOUNDER_PUBLIC = DATA_DIR / "founder.pub"
 REQUESTS_DIR = DATA_DIR / "requests"
 CERTS_DIR = DATA_DIR / "certs"
 
+M2_DIR = DATA_DIR / "m2"
+GENERATIONS_DIR = M2_DIR / "generations"
+CURRENT_FILE = M2_DIR / "current.json"
+VAULT_VERSION = 1
+VAULT_PLAINTEXT = b"Treasury vault: the club's treasure is protected by 3-of-5 shares.\n"
 
+
+# --------------------------------------------------------------------------- M1
 def setup_ca(log) -> None:
     """Create the founder's P-256 CA key and publish its public key."""
     FOUNDER_DIR.mkdir(parents=True, exist_ok=True)
@@ -39,25 +66,17 @@ def setup_ca(log) -> None:
         save_private_key(FOUNDER_PRIVATE, private_key)
         log.info("founder CA key created")
 
-    # Always re-derive the public key from the real private key, so a stale or
-    # corrupted founder.pub is repaired and everyone verifies against the
-    # correct CA key. The private key itself is never regenerated here.
     FOUNDER_PUBLIC.write_text(public_key_pem(private_key), encoding="ascii")
     log.info("founder public key written to %s", FOUNDER_PUBLIC)
     log.info("founder public key prefix %s", public_key_pem(private_key).splitlines()[1][:8])
 
 
 def sign_certificates(log, allow_partial: bool = False) -> None:
-    """Validate all requests, then stage and activate a complete certificate set.
-
-    Normal setup is fail-closed: all six requests must be present and valid before
-    anything is written. ``allow_partial`` is restricted to tests/demos.
-    """
+    """Validate all requests, then stage and activate a complete certificate set."""
     if not FOUNDER_PRIVATE.exists():
         raise RuntimeError("founder CA key is missing; run with --init first")
     founder_private_key = load_private_key(FOUNDER_PRIVATE)
 
-    # Pass 1a — locate every expected request before touching the active certs.
     selected, missing = [], []
     for name in PROGRAM_NAMES:
         request_path = REQUESTS_DIR / f"{name}.json"
@@ -70,7 +89,6 @@ def sign_certificates(log, allow_partial: bool = False) -> None:
     if missing:
         log.warning("partial issuance (test-only); missing requests: %s", ", ".join(missing))
 
-    # Pass 1b — validate every selected request, building certificates in memory.
     prepared = []
     for name, request_path in selected:
         request = json.loads(request_path.read_text(encoding="utf-8"))
@@ -80,15 +98,13 @@ def sign_certificates(log, allow_partial: bool = False) -> None:
             raise ValueError(f"public-key request name {request['name']!r} != expected {name!r}")
         public_key_pem_text = request["public_key"]
         try:
-            load_public_key(public_key_pem_text)  # P-256 only, malformed PEM rejected
+            load_public_key(public_key_pem_text)
         except ValueError as exc:
             raise ValueError(f"invalid public key in request {request_path.name}") from exc
         prepared.append((name, create_certificate(
             founder_private_key, name, public_key_pem_text, CERT_EXPIRY
         )))
 
-    # Pass 2 — stage the complete set, then activate it in one swap. A failure
-    # cannot leave a partial set or make stale certificates look newly issued.
     staging = CERTS_DIR.parent / "certs.staging"
     backup = CERTS_DIR.parent / "certs.backup"
     for directory in (staging, backup):
@@ -121,28 +137,167 @@ def sign_certificates(log, allow_partial: bool = False) -> None:
     log.info("activated %d certificate(s) in %s", len(prepared), CERTS_DIR)
 
 
+# --------------------------------------------------------------------------- M2
+def _commitments_bytes(t: int, n: int, C_hexes: list[str]) -> bytes:
+    return canonical_json(["commitments", GROUP, t, n, C_hexes])
+
+
+def _write_json(path, value: dict, private: bool = False) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.name}.{secrets.token_hex(6)}.tmp")
+    tmp.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    if private and os.name != "nt":
+        os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+
+
+def _sha256_file(path) -> str:
+    return sha256(path.read_bytes()).hex()
+
+
+def _next_generation(force: bool) -> tuple[str, object, object]:
+    GENERATIONS_DIR.mkdir(parents=True, exist_ok=True)
+    numbers = []
+    for entry in GENERATIONS_DIR.iterdir():
+        if entry.is_dir() and entry.name.startswith("generation-"):
+            suffix = entry.name[len("generation-"):]
+            if suffix.isdigit():
+                numbers.append(int(suffix))
+            if (entry / "manifest.json").exists() and not force:
+                raise ValueError("a completed generation already exists; refusing to regenerate")
+    number = max(numbers, default=0) + 1
+    name = f"generation-{number:03d}"
+    final = GENERATIONS_DIR / name
+    staging = GENERATIONS_DIR / f"{name}.tmp"
+    if staging.exists():
+        shutil.rmtree(staging)
+    return name, final, staging
+
+
+def setup_vault(log, t: int = DEFAULT_T, n: int = DEFAULT_N, force: bool = False) -> None:
+    """Generate shares, signed commitments and the encrypted vault atomically."""
+    if not (1 <= t <= n):
+        raise ValueError("require 1 <= t <= n")
+    if not FOUNDER_PRIVATE.exists():
+        raise RuntimeError("founder CA key is missing; run with --init first")
+    founder_private_key = load_private_key(FOUNDER_PRIVATE)
+
+    # Founder-only secrets: never written to disk or logged.
+    s = random_nonzero_scalar(Q)
+    coefficients, shares = make_shares(s, t, n, Q)
+    commitments = make_commitments(coefficients, P, Q, G)
+    C_hexes = [hex_element(c) for c in commitments]
+    commitments_bytes = _commitments_bytes(t, n, C_hexes)
+    D_C = sha256(commitments_bytes).hex()
+    commitments_sig = sign_raw(founder_private_key, commitments_bytes)
+
+    for index, share in enumerate(shares, start=1):
+        if not verify_share(share, index, commitments, P, Q, G):
+            raise RuntimeError(f"generated share for M{index} failed verification")
+
+    u = random_nonzero_scalar(Q)
+    m = pow(G, u, P)
+    r = random_nonzero_scalar(Q)
+    c1 = pow(G, r, P)
+    c2 = m * pow(commitments[0], r, P) % P
+    c1_hex, c2_hex = hex_element(c1), hex_element(c2)
+    key = vault_key(m, c1_hex, c2_hex, D_C)
+    aad = vault_aad(c1_hex, c2_hex, D_C)
+    nonce = (0).to_bytes(12, "big")  # vault frame counter starts at 0
+    sealed = AESGCM(key).encrypt(nonce, VAULT_PLAINTEXT, aad)
+    frame = nonce + sealed
+
+    vault_fields = {
+        "group": GROUP,
+        "version": VAULT_VERSION,
+        "t": t,
+        "n": n,
+        "c1": c1_hex,
+        "c2": c2_hex,
+        "commitments_digest": D_C,
+    }
+    vault_sig = sign_raw(founder_private_key, canonical_json(vault_fields))
+
+    generation, final, staging = _next_generation(force)
+    try:
+        public_dir = staging / "public"
+        public_dir.mkdir(parents=True, exist_ok=True)
+        for index, share in enumerate(shares, start=1):
+            _write_json(staging / f"M{index}" / "share.json",
+                        {"index": index, "s_i": hex_element(share)}, private=True)
+        _write_json(public_dir / "commitments.json", {
+            "group": GROUP, "t": t, "n": n, "commitments": C_hexes,
+            "digest": D_C, "sig": commitments_sig,
+        })
+        _write_json(public_dir / "vault.json", {**vault_fields, "sig": vault_sig})
+        (public_dir / "vault.enc").write_bytes(frame)
+
+        # Validate the whole generation before publishing it.
+        selected = list(range(1, t + 1))
+        D = 1
+        for index in selected:
+            d_i = pow(c1, shares[index - 1], P)
+            D = D * pow(d_i, lagrange_coefficient(index, selected, Q), P) % P
+        recovered_m = c2 * pow(D, -1, P) % P
+        recovered_key = vault_key(recovered_m, c1_hex, c2_hex, D_C)
+        if recovered_m != m or AESGCM(recovered_key).decrypt(nonce, sealed, aad) != VAULT_PLAINTEXT:
+            raise RuntimeError("vault self-check failed; nothing was published")
+
+        digests = {
+            str(path.relative_to(staging)): _sha256_file(path)
+            for path in sorted(staging.rglob("*")) if path.is_file()
+        }
+        _write_json(staging / "manifest.json", {
+            "generation": generation, "group": GROUP, "t": t, "n": n,
+            "commitments_digest": D_C, "artifacts": digests,
+        })
+
+        os.replace(staging, final)
+    finally:
+        if staging.exists():
+            shutil.rmtree(staging)
+
+    _write_json(CURRENT_FILE, {
+        "generation": generation, "group": GROUP, "t": t, "n": n,
+        "commitments_digest": D_C,
+    })
+    log.info("published %s: t=%d n=%d commitments_digest=%s... c1=%s... c2=%s...",
+             generation, t, n, D_C[:8], c1_hex[:8], c2_hex[:8])
+
+    # Best-effort erasure: Python integers are immutable, so this clears
+    # references rather than scrubbing memory (see docs/M2_INTERFACES.md).
+    del s, u, r, m, key, recovered_m, recovered_key, coefficients, shares
+    del commitments_bytes, sealed, frame, aad
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Treasury founder setup")
-    parser.add_argument("--t", type=int, default=3)
-    parser.add_argument("--n", type=int, default=5)
+    parser.add_argument("--t", type=int, default=DEFAULT_T)
+    parser.add_argument("--n", type=int, default=DEFAULT_N)
     parser.add_argument("--init", action="store_true", help="create the founder CA key")
     parser.add_argument("--sign-certs", action="store_true",
                         help="sign certificates from public-key request files")
     parser.add_argument("--allow-partial", action="store_true",
                         help="TEST ONLY: issue certificates from available requests")
+    parser.add_argument("--setup-vault", action="store_true",
+                        help="generate shares, commitments and the encrypted vault")
+    parser.add_argument("--force", action="store_true",
+                        help="with --setup-vault: allow replacing an existing generation")
     args = parser.parse_args()
     validate_group()
     log = get_logger("founder")
     if not (1 <= args.t <= args.n):
         parser.error("require 1 <= t <= n")
 
-    if not args.init and not args.sign_certs:
+    if not any((args.init, args.sign_certs, args.setup_vault)):
         args.init = args.sign_certs = True
     try:
         if args.init:
             setup_ca(log)
         if args.sign_certs:
             sign_certificates(log, allow_partial=args.allow_partial)
+        if args.setup_vault:
+            setup_vault(log, t=args.t, n=args.n, force=args.force)
     except ValueError as exc:
         parser.error(str(exc))
     log.info("setup complete for t=%d, n=%d", args.t, args.n)
