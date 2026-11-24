@@ -60,23 +60,47 @@ python -m pip install -r requirements.txt
 
 See `docs/M1_INTERFACES.md` for the full interface and ownership contract.
 
-## Run the baseline connection
+## Run Milestone 1 (secure channel, login, signed requests)
 
 Terminal 1:
 
 ```bash
-python -m treasury.server --name server
+python -m treasury.server
 ```
 
 Terminal 2:
 
 ```bash
-python -m treasury.member --name M1
+python -m treasury.member --name M1                          # register (first time) + interactive login + one request
+python -m treasury.member --name M1 --login noninteractive
+python -m treasury.member --name M2 --op spend --body '{"amount": 7}' --count 2
 ```
 
-The member sends a baseline `hello` message and the server logs and acknowledges it. This is **only a transport smoke test**; it is not the secure channel, certificate validation, login, or signed-request protocol required by Milestone 1.
+Each connection runs: signed ECDH handshake → AES-256-GCM channel → registration → login →
+signed requests. The server logs every accepted/rejected step in `runtime/logs/server.log`.
 
 Stop either program with Ctrl+C.
+
+## A1 — unsigned handshake (Mallory MITM)
+
+Three terminals, all with the deliberate weakness:
+
+```bash
+python -m treasury.server --weak unsigned-handshake
+python -m treasury.mallory --attack A1 --weak unsigned-handshake        # add --tamper modify | replay
+python -m treasury.member --name M1 --port 6000 --weak unsigned-handshake
+```
+
+Mallory swaps both ephemeral keys and reads every message (registration, login, the signed
+request). With `--tamper modify` the server rejects the altered request (ECDSA signature), with
+`--tamper replay` it rejects the old sequence number. Run the server and member **without**
+`--weak` and the member rejects the handshake (`invalid server handshake signature`).
+
+One-command scripted demo (temporary identities, does not touch `runtime/`):
+
+```bash
+python -m attacks.a1_unsigned_handshake
+```
 
 ## Project layout
 
@@ -88,16 +112,20 @@ treasury/
   framing.py         4-byte big-endian length-prefixed JSON over TCP
   network.py         Small reusable TCP server/client helpers
   certificates.py    Certificate data model and TODOs
-  channel.py         Milestone 1 ECDH/handshake/AES-GCM TODOs
+  channel.py         HKDF directional keys + AES-256-GCM frames (Member 3)
   login.py           Milestone 1 proof-of-knowledge login TODOs
   requests.py        Milestone 1 signed request/replay protection TODOs
   sharing.py         Milestone 2 Shamir sharing/commitment TODOs
   opening.py         Milestone 2 verifiable decryption TODOs
   voting.py          Milestone 3 encrypted ballot TODOs
-  server.py          Runnable baseline server
-  member.py          Runnable baseline member
-  founder.py         Founder setup entry point (TODO)
-  mallory.py         Attack harness entry point (TODO)
+  handshake.py       Signed ephemeral ECDH handshake (Member 2)
+  server.py          Threaded secure server: registration, login, signed requests (Member 2)
+  member.py          Member client flow (Member 3)
+  founder.py         Founder CA setup and certificate issuance (Member 1)
+  mallory.py         Attack harness: A1 MITM proxy (Member 2)
+attacks/
+  a1_unsigned_handshake.py   Scripted A1 demo
+  a3_short_challenge.py      A3 short-challenge demo
 ```
 
 ## Important rules
