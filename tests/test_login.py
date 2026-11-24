@@ -1,6 +1,7 @@
 import unittest
 
-from treasury.group import G, P, Q, is_valid_element
+from treasury.encoding import H
+from treasury.group import G, P, Q, is_valid_element, random_exponent
 from treasury.login import (SECURE_CHALLENGE_BITS, WEAK_CHALLENGE_BITS,
                             generate_challenge, make_interactive_response,
                             make_noninteractive_response, register_login_secret,
@@ -117,6 +118,59 @@ class LoginTests(unittest.TestCase):
         self.assertFalse(verify_noninteractive_login("", R, z, nonce, self.X))
         self.assertFalse(verify_noninteractive_login("M1", R, z, "", self.X))
         self.assertFalse(verify_noninteractive_login("M1", R, z, None, self.X))
+
+
+    def test_noninteractive_uses_exact_login_label(self):
+        nonce = "00000000000000000000000000000001"
+        R, z = make_noninteractive_response(self.x, "M1", nonce)
+        challenge = H("login", "M1", self.X, R, nonce, q=Q)
+        self.assertTrue(verify_noninteractive_login("M1", R, z, nonce, self.X))
+        self.assertNotEqual(challenge, H("login-ni", "M1", self.X, R, nonce, q=Q))
+
+    def test_noninteractive_rejects_proof_created_with_wrong_label(self):
+        """A valid proof for the old label must be rejected by the verifier."""
+        name, nonce = "M1", "00000000000000000000000000000002"
+        k = random_exponent(Q)
+        R = pow(G, k, P)
+        wrong_challenge = H("login-ni", name, self.X, R, nonce, q=Q)
+        z = (k + wrong_challenge * self.x) % Q
+        self.assertTrue(pow(G, z, P) == (R * pow(self.X, wrong_challenge, P)) % P)
+        self.assertFalse(verify_noninteractive_login(name, R, z, nonce, self.X))
+
+    def test_same_nonce_string_gives_identical_challenge(self):
+        nonce = "00000000000000000000000000000003"
+        R, X_M, name = pow(G, 54321, P), self.X, "M1"
+        self.assertEqual(H("login", name, X_M, R, nonce, q=Q),
+                         H("login", name, X_M, R, nonce, q=Q))
+        first = make_noninteractive_response(self.x, name, nonce)
+        second = make_noninteractive_response(self.x, name, nonce)
+        self.assertTrue(verify_noninteractive_login(name, *first, nonce, X_M))
+        self.assertTrue(verify_noninteractive_login(name, *second, nonce, X_M))
+
+    def test_different_nonce_changes_challenge_for_fixed_inputs(self):
+        nonce_a = "00000000000000000000000000000001"
+        nonce_b = "00000000000000000000000000000002"
+        R, X_M, name = pow(G, 12345, P), self.X, "M1"
+        challenge_a = H("login", name, X_M, R, nonce_a, q=Q)
+        challenge_b = H("login", name, X_M, R, nonce_b, q=Q)
+        self.assertNotEqual(challenge_a, challenge_b)
+
+    def test_leading_zero_nonce_is_preserved_verbatim(self):
+        nonce = "0000000000000000000000000000000f"  # 32 lowercase hex characters
+        self.assertEqual(len(nonce), 32)
+        R, z = make_noninteractive_response(self.x, "M1", nonce)
+        self.assertTrue(verify_noninteractive_login("M1", R, z, nonce, self.X))
+        exact = H("login", "M1", self.X, R, nonce, q=Q)
+        normalized = H("login", "M1", self.X, R, nonce.lstrip("0"), q=Q)
+        self.assertNotEqual(exact, normalized)
+
+    def test_integer_nonce_is_not_equivalent_to_hex_string(self):
+        nonce = "0000000000000000000000000000000f"
+        R, z = make_noninteractive_response(self.x, "M1", nonce)
+        self.assertFalse(verify_noninteractive_login("M1", R, z, int(nonce, 16), self.X))
+        as_string = H("login", "M1", self.X, R, nonce, q=Q)
+        as_integer = H("login", "M1", self.X, R, int(nonce, 16), q=Q)
+        self.assertNotEqual(as_string, as_integer)
 
 
 if __name__ == "__main__":

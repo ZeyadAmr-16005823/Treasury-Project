@@ -1,9 +1,13 @@
 """Milestone 1 proof-of-knowledge (Schnorr) login.
 
-Non-interactive transcript (freeze in docs/M1_INTERFACES.md):
+Non-interactive transcript (frozen in docs/M1_INTERFACES.md):
 
-    e = H("login-ni", name, X_M, R, nonce, q=q)
+    e = H("login", name, X_M, R, nonce, q=q)
     z = k + e * x_M mod q
+
+``q=q`` is the hash function's modulus/output-range parameter, not a value in
+the transcript. ``X_M`` and ``R`` are integers (encoded as hex by ``H``);
+``nonce`` is a lowercase hex string and must be preserved verbatim.
 
 The verifier must take ``name`` from the certified session identity, not from
 the proof message.  ``nonce`` is a fresh server-supplied value.
@@ -16,7 +20,7 @@ from .group import G, P, Q, is_valid_element, random_exponent
 
 SECURE_CHALLENGE_BITS = 128
 WEAK_CHALLENGE_BITS = 4
-NONINTERACTIVE_LABEL = "login-ni"
+NONINTERACTIVE_LABEL = "login"
 
 ChallengeSource = Callable[[], int]
 
