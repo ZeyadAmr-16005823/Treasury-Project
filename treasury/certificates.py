@@ -2,6 +2,8 @@
 from dataclasses import dataclass, asdict
 from datetime import date
 
+from cryptography.exceptions import UnsupportedAlgorithm
+
 from .config import GROUP
 from .crypto_utils import load_public_key, sign_raw, verify_raw
 from .encoding import canonical_json
@@ -55,7 +57,7 @@ def verify_certificate(certificate: dict, founder_public_key, expected_name: str
         if date.fromisoformat(certificate["expires"]) < date.today():
             return False
         load_public_key(certificate["public_key"])
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, UnsupportedAlgorithm):
         return False
     unsigned = {field: value for field, value in certificate.items() if field != "sig"}
     return verify_raw(founder_public_key, canonical_json(unsigned), certificate["sig"])

@@ -7,7 +7,7 @@ generation/storage and the conversion between DER signatures (used by the
 import os
 from pathlib import Path
 
-from cryptography.exceptions import InvalidSignature
+from cryptography.exceptions import InvalidSignature, UnsupportedAlgorithm
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives.asymmetric.utils import (
@@ -52,17 +52,31 @@ def save_private_key(path, key: ec.EllipticCurvePrivateKey) -> None:
 
 
 def load_private_key(path) -> ec.EllipticCurvePrivateKey:
-    """Load a P-256 private key written by :func:`save_private_key`."""
-    key = serialization.load_pem_private_key(Path(path).read_bytes(), password=None)
+    """Load a P-256 private key written by :func:`save_private_key`.
+
+    Invalid PEM, unsupported algorithms and non-P-256 keys all raise
+    ``ValueError`` so callers can handle failures consistently.
+    """
+    try:
+        key = serialization.load_pem_private_key(Path(path).read_bytes(), password=None)
+    except (ValueError, TypeError, UnsupportedAlgorithm) as exc:
+        raise ValueError("invalid or unsupported private key PEM") from exc
     if not isinstance(key, ec.EllipticCurvePrivateKey) or not isinstance(key.curve, ec.SECP256R1):
         raise ValueError("private key is not a P-256 key")
     return key
 
 
 def load_public_key(pem_or_bytes) -> ec.EllipticCurvePublicKey:
-    """Load a P-256 public key from PEM text or bytes."""
+    """Load a P-256 public key from PEM text or bytes.
+
+    Only P-256 keys are accepted; malformed PEM and unsupported key types
+    (e.g. RSA or another curve) raise ``ValueError``.
+    """
     data = pem_or_bytes.encode("ascii") if isinstance(pem_or_bytes, str) else bytes(pem_or_bytes)
-    key = serialization.load_pem_public_key(data)
+    try:
+        key = serialization.load_pem_public_key(data)
+    except (ValueError, UnsupportedAlgorithm) as exc:
+        raise ValueError("invalid or unsupported public key PEM") from exc
     if not isinstance(key, ec.EllipticCurvePublicKey) or not isinstance(key.curve, ec.SECP256R1):
         raise ValueError("public key is not a P-256 key")
     return key

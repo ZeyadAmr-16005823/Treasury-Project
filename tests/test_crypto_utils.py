@@ -2,7 +2,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import ec, rsa
 
 from treasury.crypto_utils import (
     generate_p256_keypair,
@@ -39,6 +40,34 @@ class CryptoUtilsTests(unittest.TestCase):
         for bad in ("", signature[:-1], signature + "0", "z" * 128,
                     signature.upper(), None):
             self.assertFalse(verify_raw(self.public_key, b"message", bad))
+
+    def test_unsupported_or_malformed_public_keys_are_rejected(self):
+        rsa_pem = rsa.generate_private_key(public_exponent=65537, key_size=2048).public_key()
+        other_curve = ec.generate_private_key(ec.SECP384R1()).public_key()
+        candidates = [
+            rsa_pem.public_bytes(serialization.Encoding.PEM,
+                                 serialization.PublicFormat.SubjectPublicKeyInfo),
+            other_curve.public_bytes(serialization.Encoding.PEM,
+                                     serialization.PublicFormat.SubjectPublicKeyInfo),
+            b"not a PEM key",
+            b"",
+        ]
+        for candidate in candidates:
+            with self.subTest(candidate=candidate[:32]):
+                with self.assertRaises(ValueError):
+                    load_public_key(candidate)
+
+    def test_non_p256_private_key_is_rejected(self):
+        other_key = ec.generate_private_key(ec.SECP384R1())
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "other.pem"
+            path.write_bytes(other_key.private_bytes(
+                serialization.Encoding.PEM,
+                serialization.PrivateFormat.PKCS8,
+                serialization.NoEncryption(),
+            ))
+            with self.assertRaises(ValueError):
+                load_private_key(path)
 
     def test_private_and_public_key_io(self):
         with tempfile.TemporaryDirectory() as directory:
