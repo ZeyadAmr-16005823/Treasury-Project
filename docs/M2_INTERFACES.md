@@ -63,10 +63,14 @@ lagrange_coefficient(i: int, selected_indices: list[int], q: int) -> int
 
 - Polynomial: `f(x) = a₀ + a₁x + … + a_{t−1}x^{t−1} mod q`, `a₀ = s`, degree **at most** `t−1`.
   All coefficients are sampled from all of ℤ_q as the handout specifies. Consequently the highest
-  coefficient can be zero; then `C_{t−1} = 1` publicly reveals a lower-degree polynomial and the
-  effective threshold drops. Probability `1/q` is negligible for this group but nonzero. Ask the TA
-  whether to instead sample `a_{t−1}` from ℤ_q* to guarantee exact degree `t−1`. Do not silently
-  change the handout's rule; until clarified, describe the polynomial as "degree at most t−1".
+  coefficient can be zero; then `C_{t−1} = 1` publicly reveals a lower-degree polynomial. How far the
+  effective threshold drops depends on the remaining coefficients: with `a_{t−1}=0, a_{t−2}≠0` a
+  polynomial of degree `t−2` remains and `t−1` shares suffice; if every higher coefficient is also
+  zero the polynomial is constant and **one** share reveals `s`. Probability `1/q` per coefficient is
+  negligible for this group but nonzero. Ask the TA whether to instead sample `a_{t−1}` from ℤ_q* to
+  guarantee exact degree `t−1`. Do not silently change the handout's rule; until clarified, describe
+  the polynomial as "degree at most t−1". The deterministic test uses nonzero lower coefficients when
+  demonstrating the two-share case.
 - `make_shares` returns `(coefficients, [f(1), …, f(n)])`; uses `secrets.randbelow(q)`, never `random`.
 - `verify_share`: validates index `1…n`, scalar range, commitment list length `t`, `C₀ != 1`, all
   commitments in subgroup (identity permitted for `k≥1`), then checks `g^{share} == ∏ C_k^{i^k} mod p`.
@@ -146,12 +150,22 @@ runtime/data/M5/share.json
 
 **Private-share handoff.** The founder generates all five shares but publishes **only public data**
 in the generation directory. Each share is written into the corresponding member's own private
-directory (`runtime/data/M<i>/share.json`), standing for an in-person handover. A member reads only
-its own `share.json`; the server and Mallory never read share files. 0600 permissions on POSIX are
-defence in depth, but since all programs may run as the same OS user, the real isolation is the
-application rule: **no program opens another program's private directory**. Each share file is
-`{"index": i, "generation": "generation-NNN", "s_i": "<512hex>"}`; a member uses it only when its
-`generation` matches `current.json`.
+directory (`runtime/data/M<i>/share.json`), standing for an in-person handover.
+
+Ownership rules (enforced by application code, not just filesystem permissions):
+
+- `M1` reads only `runtime/data/M1/share.json`; `M2` only `runtime/data/M2/share.json`; and so on.
+  No member program opens another member's directory or share file.
+- The server and Mallory never read any private share file — they receive only public commitments,
+  vault metadata and ciphertext, plus decryption shares produced over the secure channel.
+- After setup the founder does not retain, load or re-read all five shares; it keeps only its own CA
+  key and the published public artifacts.
+- No share value is logged or written to a public manifest; manifests contain only digests.
+- 0600 permissions on POSIX are defence in depth. Because all programs may run as the same OS user,
+  they do **not** provide process isolation — the ownership boundary above is the real control.
+
+Each share file is `{"index": i, "generation": "generation-NNN", "s_i": "<512hex>"}`; a member uses
+it only when its `generation` matches `current.json`.
 
 **Atomic publication:** build the public artifacts in `generation-NNN.tmp` on the same filesystem,
 validate shares + signatures + vault decryption there, write `manifest.json` last, hand the shares

@@ -74,6 +74,8 @@ class SharingTests(unittest.TestCase):
         self.assertEqual(commitments[2], 1)
         self.assertTrue(verify_share(secret, 3, commitments, P, Q, G))
         self.assertFalse(verify_share(secret + 1, 3, commitments, P, Q, G))
+        # Every higher coefficient zero -> constant polynomial: one share is enough.
+        self.assertEqual(secret * lagrange_coefficient(1, [1], Q) % Q, secret)
 
         # A polynomial with f(1)=0 produces a zero share and h_i=1.
         a2 = 1
