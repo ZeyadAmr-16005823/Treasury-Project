@@ -57,7 +57,8 @@ class FounderVaultTests(unittest.TestCase):
         C = [int(value, 16) for value in commitments["commitments"]]
         shares = []
         for index in range(1, 6):
-            record = json.loads(founder.member_share_path(f"M{index}").read_text())
+            record = json.loads(founder.member_share_path(
+                f"M{index}", current["generation"]).read_text())
             self.assertEqual((record["index"], record["generation"]), (index, current["generation"]))
             share = int(record["s_i"], 16)
             self.assertTrue(verify_share(share, index, C, P, Q, G))
@@ -104,6 +105,10 @@ class FounderVaultTests(unittest.TestCase):
         founder.setup_vault(self.log)
         first_current, _ = self.current_generation()
         first_manifest = (founder.GENERATIONS_DIR / "generation-001" / "manifest.json").read_text()
+        old_shares = {
+            i: founder.member_share_path(f"M{i}", "generation-001").read_text()
+            for i in range(1, 6)
+        }
         founder.setup_vault(self.log, force=True)
         second_current, second = self.current_generation()
         self.assertEqual(first_current["generation"], "generation-001")
@@ -113,24 +118,44 @@ class FounderVaultTests(unittest.TestCase):
             (founder.GENERATIONS_DIR / "generation-001" / "manifest.json").read_text(),
             first_manifest,
         )
+        for i in range(1, 6):
+            self.assertEqual(founder.member_share_path(f"M{i}", "generation-001").read_text(),
+                             old_shares[i])
+            self.assertTrue(founder.member_share_path(f"M{i}", "generation-002").exists())
 
-    def test_interrupted_forced_regeneration_keeps_old_pointer(self):
+    def test_interrupted_forced_regeneration_keeps_old_shares_usable(self):
         founder.setup_vault(self.log)
         before, _ = self.current_generation()
-        with patch.object(founder, "verify_share", return_value=False):
+        old_shares = {
+            i: founder.member_share_path(f"M{i}", "generation-001").read_text()
+            for i in range(1, 6)
+        }
+
+        def partial_activation(generation, n):
+            # Simulate a crash after M1's new share has been activated.
+            staging_dir = founder.member_share_staging_path("M1", generation)
+            final_dir = founder.member_share_path("M1", generation).parent
+            os.replace(staging_dir, final_dir)
+            raise RuntimeError("simulated interruption after one share")
+
+        with patch.object(founder, "_activate_shares", side_effect=partial_activation):
             with self.assertRaises(RuntimeError):
                 founder.setup_vault(self.log, force=True)
+
         after, _ = self.current_generation()
         self.assertEqual(after, before)
-        self.assertFalse((founder.GENERATIONS_DIR / "generation-002").exists())
-        self.assertFalse((founder.GENERATIONS_DIR / "generation-002.tmp").exists())
+        for i in range(1, 6):
+            path = founder.member_share_path(f"M{i}", "generation-001")
+            self.assertEqual(path.read_text(), old_shares[i])
 
     def test_share_files_have_restrictive_permissions(self):
         if os.name == "nt":
             self.skipTest("POSIX permission bits are not meaningful on Windows")
         founder.setup_vault(self.log)
+        current, _ = self.current_generation()
         for index in range(1, 6):
-            mode = os.stat(founder.member_share_path(f"M{index}")).st_mode & 0o777
+            path = founder.member_share_path(f"M{index}", current["generation"])
+            mode = os.stat(path).st_mode & 0o777
             self.assertEqual(mode, 0o600)
 
     def test_failed_validation_publishes_nothing(self):
@@ -142,10 +167,10 @@ class FounderVaultTests(unittest.TestCase):
 
     def test_generic_two_of_four_setup(self):
         founder.setup_vault(self.log, t=2, n=4)
-        _, generation = self.current_generation()
+        current, generation = self.current_generation()
         for index in range(1, 5):
-            self.assertTrue(founder.member_share_path(f"M{index}").exists())
-        self.assertFalse(founder.member_share_path("M5").exists())
+            self.assertTrue(founder.member_share_path(f"M{index}", current["generation"]).exists())
+        self.assertFalse(founder.member_share_path("M5", current["generation"]).exists())
         commitments = json.loads((generation / "public" / "commitments.json").read_text())
         self.assertEqual(len(commitments["commitments"]), 2)
 
@@ -155,7 +180,7 @@ class FounderVaultTests(unittest.TestCase):
         with patch.object(founder, "random_nonzero_scalar",
                           side_effect=[known_s, known_u, known_r]):
             founder.setup_vault(self.log)
-        _, generation = self.current_generation()
+        current, generation = self.current_generation()
         vault = json.loads((generation / "public" / "vault.json").read_text())
         m = pow(G, known_u, P)
         key = vault_key(m, vault["c1"], vault["c2"], vault["commitments_digest"])
@@ -165,7 +190,7 @@ class FounderVaultTests(unittest.TestCase):
         ]
         forbidden = {"s", "u", "r", "m", "key", "a0", "a1", "a2"}
         paths = list(generation.rglob("*.json")) + [
-            founder.member_share_path(f"M{i}") for i in range(1, 6)
+            founder.member_share_path(f"M{i}", current["generation"]) for i in range(1, 6)
         ]
         for path in paths:
             text = path.read_text(encoding="utf-8")
