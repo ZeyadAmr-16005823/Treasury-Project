@@ -21,6 +21,7 @@ class FounderVaultTests(unittest.TestCase):
         self.addCleanup(temporary.cleanup)
         root = Path(temporary.name)
         patches = [
+            patch.object(founder, "DATA_DIR", root),
             patch.object(founder, "FOUNDER_DIR", root / "founder"),
             patch.object(founder, "FOUNDER_PRIVATE", root / "founder" / "founder_private.pem"),
             patch.object(founder, "FOUNDER_PUBLIC", root / "founder.pub"),
@@ -44,6 +45,7 @@ class FounderVaultTests(unittest.TestCase):
         current, generation = self.current_generation()
         self.assertEqual((current["t"], current["n"], current["group"]), (3, 5, GROUP))
         self.assertTrue((generation / "manifest.json").exists())
+        self.assertFalse(list(generation.rglob("share.json")))  # no central private copy
 
         commitments = json.loads((generation / "public" / "commitments.json").read_text())
         commitments_bytes = canonical_json(
@@ -55,8 +57,8 @@ class FounderVaultTests(unittest.TestCase):
         C = [int(value, 16) for value in commitments["commitments"]]
         shares = []
         for index in range(1, 6):
-            record = json.loads((generation / f"M{index}" / "share.json").read_text())
-            self.assertEqual(record["index"], index)
+            record = json.loads(founder.member_share_path(f"M{index}").read_text())
+            self.assertEqual((record["index"], record["generation"]), (index, current["generation"]))
             share = int(record["s_i"], 16)
             self.assertTrue(verify_share(share, index, C, P, Q, G))
             shares.append(share)
@@ -127,9 +129,8 @@ class FounderVaultTests(unittest.TestCase):
         if os.name == "nt":
             self.skipTest("POSIX permission bits are not meaningful on Windows")
         founder.setup_vault(self.log)
-        _, generation = self.current_generation()
         for index in range(1, 6):
-            mode = os.stat(generation / f"M{index}" / "share.json").st_mode & 0o777
+            mode = os.stat(founder.member_share_path(f"M{index}")).st_mode & 0o777
             self.assertEqual(mode, 0o600)
 
     def test_failed_validation_publishes_nothing(self):
@@ -143,8 +144,8 @@ class FounderVaultTests(unittest.TestCase):
         founder.setup_vault(self.log, t=2, n=4)
         _, generation = self.current_generation()
         for index in range(1, 5):
-            self.assertTrue((generation / f"M{index}" / "share.json").exists())
-        self.assertFalse((generation / "M5").exists())
+            self.assertTrue(founder.member_share_path(f"M{index}").exists())
+        self.assertFalse(founder.member_share_path("M5").exists())
         commitments = json.loads((generation / "public" / "commitments.json").read_text())
         self.assertEqual(len(commitments["commitments"]), 2)
 
@@ -163,13 +164,16 @@ class FounderVaultTests(unittest.TestCase):
             format(m, "0512x"), key.hex(),
         ]
         forbidden = {"s", "u", "r", "m", "key", "a0", "a1", "a2"}
-        for path in generation.rglob("*.json"):
+        paths = list(generation.rglob("*.json")) + [
+            founder.member_share_path(f"M{i}") for i in range(1, 6)
+        ]
+        for path in paths:
             text = path.read_text(encoding="utf-8")
             for form in secret_forms:
                 self.assertNotIn(form, text, f"{form[:8]}... appeared in {path.name}")
             data = json.loads(text)
             if path.name == "share.json":
-                self.assertEqual(set(data), {"index", "s_i"})
+                self.assertEqual(set(data), {"index", "generation", "s_i"})
             else:
                 self.assertFalse(forbidden.intersection(data))
         frame = (generation / "public" / "vault.enc").read_bytes()

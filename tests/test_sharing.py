@@ -86,6 +86,7 @@ class SharingTests(unittest.TestCase):
     def test_zero_highest_coefficient_is_a_documented_exception(self):
         secret = 321
         coefficients = [secret, 999, 0]
+        self.assertNotEqual(coefficients[1], 0)  # nonzero a1: two shares determine s
         commitments = make_commitments(coefficients, P, Q, G)
         self.assertEqual(commitments[-1], 1)  # C_2 = g^0 = 1 is public evidence
         shares = [evaluate_polynomial(coefficients, i, Q) for i in range(1, 6)]
