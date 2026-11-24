@@ -131,14 +131,29 @@ AES-GCM and signed-request verification stay enabled.
 
 ```python
 derive_directional_keys(shared_secret: bytes, member_name: str,
-                        X_hex: str, Y_hex: str) -> tuple[bytes, bytes]
+                        X_hex: str, Y_hex: str) -> tuple[bytes, bytes]   # (k_m2s, k_s2m)
+class ChannelError(framing.ProtocolError)   # any bad frame -> close the connection
 class SecureChannel:
     def __init__(self, send_key: bytes, receive_key: bytes): ...
+    @classmethod for_member(shared_secret, member_name, X_hex, Y_hex)  # send k_m2s, recv k_s2m
+    @classmethod for_server(shared_secret, member_name, X_hex, Y_hex)  # send k_s2m, recv k_m2s
+    @classmethod from_session(session: SessionContext, role: "member" | "server")
     def encrypt(self, plaintext: bytes) -> bytes: ...   # 12-byte counter nonce || ciphertext+tag
-    def decrypt(self, frame: bytes) -> bytes: ...       # strict next counter, reject on failure
+    def decrypt(self, frame: bytes) -> bytes: ...       # strict next counter, raises ChannelError
+    def close(self) -> None: ...                        # forget keys; later use raises
+send_secure(sock, channel | None, message: dict) -> None
+recv_secure(sock, channel | None) -> dict | None        # None = peer closed cleanly
+send_frame(sock, frame: bytes) / recv_frame(sock) -> bytes | None
+build_handshake_transcript(name, X_hex, Y_hex)          # kept as wrapper
 ```
 HKDF-SHA256, no salt, info = `b"ICS505|" + GROUP.encode() + b"|channel|" + sha256(canonical_json(build_handshake_transcript(...))).digest()`;
 64 bytes → first 32 member→server, last 32 server→member. Counters start at 0 per direction.
+No AES-GCM associated data. A frame is accepted only if its nonce equals the next expected counter
+and GCM authentication succeeds; after the first failure the channel is closed for good.
+
+Wire format of an encrypted frame: 4-byte big-endian length, then the raw frame bytes
+(so Wireshark shows the counter 0, 1, 2, … right after the length). The plaintext is compact JSON.
+`channel=None` is the `--weak no-encryption` mode: messages go as plain `framing.send_json` frames.
 
 ## 10. `login.py` — Member 4
 
@@ -182,6 +197,24 @@ Registration is signed by the member over `["register", GROUP, name, X_M_hex]` u
 `server.py` (Member 2) calls exported functions from `certificates.py`, `requests.py`, `login.py`,
 `opening.py`, `voting.py` — it never copies their logic. `member.py` (Member 3) owns the client flow
 connect → handshake → channel → registration/login → signed requests.
+
+Member files: `runtime/data/<name>/private.pem`, `login_secret.json` (`x_M`, `X_M`, `registered`),
+`state.json` (`last_seq`). `member --init` writes the key, the public request and the login secret.
+
+Messages after the handshake, all sent with `send_secure` / `recv_secure` (integers are lowercase hex
+without `0x`; the server answers every step and the member closes on `ok: false`):
+
+| Step | Member → server | Server → member |
+|---|---|---|
+| Register (first time, or `--register`) | `{"type":"register","X_M":hex,"sig":hex128}`, sig over `["register", GROUP, name, X_M_hex]` | `{"type":"register-result","ok":bool,"status"?:str,"error"?:str}` |
+| Interactive login | `{"type":"login","mode":"interactive","R":hex}` then `{"type":"login-response","z":hex}` | `{"type":"challenge","e":hex}` then `{"type":"login-result","ok":bool,"last_seq"?:int}` |
+| Non-interactive login | `{"type":"login","mode":"noninteractive"}` then `{"type":"login-proof","R":hex,"z":hex}` | `{"type":"login-nonce","nonce":hex-string}` then `{"type":"login-result","ok":bool,"last_seq"?:int}` |
+| Signed request | `{"type":"request","request":{op,seq,body,name,sig}}` (from `requests.sign_request`) | `{"type":"request-result","ok":bool,"seq":int,"error"?:str}` |
+| End | `{"type":"bye"}` | — |
+
+`name` for registration, login and requests is always the certified name from the handshake.
+`last_seq` in `login-result` is optional; the member uses `max(local last_seq, server last_seq) + 1`.
+Requests are only accepted after a successful login on the same connection.
 
 ## 12. Forward contracts for later weeks
 
