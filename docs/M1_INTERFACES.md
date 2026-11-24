@@ -31,6 +31,27 @@ runtime/logs/<program>.log      # via logging_utils.get_logger
 
 `<name>` is `server` or `M1`…`M5` (`config.PROGRAM_NAMES`).
 
+### Public-key request workflow (identity setup)
+
+| Step | Owner | Generates / writes |
+|---|---|---|
+| 1 | Member 2 — `server --init` | `runtime/data/server/private.pem` and `runtime/data/requests/server.json` |
+| 2 | Member 3 — `member --init` | `runtime/data/M1…M5/private.pem` and `runtime/data/requests/M1…M5.json` |
+| 3 | Member 1 — `founder --init --sign-certs` | Reads the six public requests and writes `runtime/data/certs/<name>.json` |
+
+Each request file has exactly this shape:
+```json
+{"name": "M1", "public_key": "-----BEGIN PUBLIC KEY-----\n...\n-----END PUBLIC KEY-----\n"}
+```
+The public key is a P-256 key in PEM (`SubjectPublicKeyInfo`) form. **The private key stays in the
+owning program's own directory and is never sent to or read by the founder.** `founder.py` reads
+only the six public request files and its own CA private key. Use the helpers in `crypto_utils.py`
+(`generate_p256_keypair`, `save_private_key`, `public_key_pem`) to produce these files.
+
+Normal setup requires all six requests; `--allow-partial` is test-only. Issuance validates every
+request first, then stages and activates the complete certificate set, so a failure never leaves a
+partially issued or stale certificate directory.
+
 ## 3. `config.py` — Member 1
 
 ```python
