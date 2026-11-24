@@ -142,17 +142,40 @@ HKDF-SHA256, no salt, info = `b"ICS505|" + GROUP.encode() + b"|channel|" + sha25
 
 ## 10. `login.py` — Member 4
 
+Actual public API (do not change without team agreement):
+
 ```python
-register_login_secret(name, p, q, g) -> tuple[int, int]                  # (x_M, X_M)
-make_interactive_response(x_M, k, e, q) -> tuple[int, int]               # (R, z)
+register_login_secret(name, p, q, g) -> tuple[int, int]                     # (x_M, X_M)
+make_interactive_response(x_M, challenge, q) -> tuple[int, int]             # (R, z)
 verify_interactive_login(R, z, e, X_M, p, q, g) -> bool
-make_noninteractive_response(x_M, name, X_M_pub, N, k, p, q) -> tuple[int, int]
-verify_noninteractive_login(R, z, e, X_M, N, p, q, g) -> bool
+make_noninteractive_response(x_M, name, nonce, p=P, q=Q, g=G) -> tuple[int, int]  # (R, z)
+verify_noninteractive_login(name, R, z, nonce, X_M, p=P, q=Q, g=G) -> bool
 ```
-Server-side `handle_interactive(..., make_challenge=callable)` allows deterministic tests.
-Registration is signed over `["register", GROUP, name, X_M_hex]`; `name` must match the certified
-session identity; the first `X_M` per name is persisted in `server/registrations.json` with a lock and
-atomic write. `X_M` and `R` must pass `group.is_valid_element`.
+
+Interactive login: `R = g^k mod p`, `z = k + e·x_M mod q`; the server accepts when
+`g^z = R · X_M^e mod p`. `R` and `X_M` must pass `group.is_valid_element`. The
+`source=` argument of `generate_challenge()` allows deterministic tests.
+
+Non-interactive transcript, exactly as specified in Milestone 1:
+
+```
+e = H("login", name, X_M, R, nonce, q=q)
+z = k + e * x_M mod q
+```
+
+- `q=q` is `H`'s modulus/output-range parameter, **not** a value in the transcript.
+- `X_M` and `R` are integers; `H` encodes them with `format(v, "x")`.
+- `nonce` is a **lowercase hex string** produced by `secrets.token_bytes(16).hex()`, preserved
+  verbatim on both sides. Passing the equivalent integer instead produces a different challenge.
+- The verifier takes `name` from the certified session identity, not from the proof message.
+
+Responsibilities: `login.py` calculates the challenge and verifies the mathematics only; it does
+not track used nonces. `server.py` (Member 2) issues fresh nonces, checks that each nonce was issued
+for that member/session, consumes it atomically, and rejects reuse.
+
+Registration is signed by the member over `["register", GROUP, name, X_M_hex]` using
+`crypto_utils.sign_raw`; the server persists the first `X_M` per certified name in
+`server/registrations.json` with a lock and atomic write.
 
 ## 11. Server/member integration — Members 2 / 3
 
