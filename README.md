@@ -26,6 +26,40 @@ python -m pip install -r requirements.txt
 2. Agree on the same `GROUP` value across every machine/program.
 3. Read `docs/IMPLEMENTATION_CHECKLIST.md` and the project Overview/Milestones supplied by the instructor.
 
+## Identity setup (Milestone 1)
+
+1. Initialise each program so it generates **its own** P-256 identity key and writes a **public**
+   key request (implemented by Member 2 for `server` and Member 3 for `M1`–`M5`):
+
+   ```bash
+   python -m treasury.server --init
+   python -m treasury.member --name M1 --init     # repeat for M2 … M5
+   ```
+
+   Each request is `runtime/data/requests/<name>.json` with
+   `{"name": "M1", "public_key": "<PEM>"}`. The private key stays in
+   `runtime/data/<name>/private.pem` — the founder never reads it.
+
+2. Create the founder CA key and sign all six certificates:
+
+   ```bash
+   python -m treasury.founder --init --sign-certs
+   ```
+
+   This requires all six requests. It fails clearly and writes nothing if any request is missing
+   or malformed. Certificates are staged and activated as a complete set, so a failed run cannot
+   leave stale certificates that look newly issued.
+
+   `--allow-partial` exists **for tests and demos only**:
+
+   ```bash
+   python -m treasury.founder --sign-certs --allow-partial
+   ```
+
+   It is **not** the normal team setup procedure and must never be used for the live evaluation.
+
+See `docs/M1_INTERFACES.md` for the full interface and ownership contract.
+
 ## Run the baseline connection
 
 Terminal 1:
