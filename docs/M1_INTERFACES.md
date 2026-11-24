@@ -122,10 +122,29 @@ hs_server_transcript(name, X_hex, Y_hex) -> list   # ["hs-server", GROUP, name, 
 hs_member_transcript(name, X_hex, Y_hex) -> list   # ["hs-member", GROUP, name, X_hex, Y_hex]
 build_handshake_transcript(name, X_hex, Y_hex) -> list  # ["hs", GROUP, name, X_hex, Y_hex]
 ```
-`SessionContext` carries `shared_secret: bytes`, `member_name: str`, `X_hex: str`, `Y_hex: str`.
-`build_handshake_transcript()` remains importable from `channel.py` as a backward-compatible wrapper.
-Weak mode `unsigned-handshake` omits **both** handshake signatures; certificate verification,
-AES-GCM and signed-request verification stay enabled.
+`SessionContext` carries `shared_secret: bytes`, `member_name: str`, `X_hex: str`, `Y_hex: str`
+(plus `peer_certificate`, `peer_public_key`, `signed`). `member_name` is always the **certified**
+name. `build_handshake_transcript()` is implemented once in `channel.py` and re-exported by
+`handshake.py`. Helpers also used by Mallory: `generate_ephemeral()`, `decode_point(hex)`, `ecdh(key, hex)`.
+Failures raise `HandshakeError` (a `framing.ProtocolError`).
+
+Wire messages (plain `framing.send_json` frames, before the channel exists):
+
+| # | Direction | Message |
+|---|---|---|
+| 1 | member → server | `{"type":"hs-hello","cert":member_cert,"X":X_hex}` |
+| 2 | server → member | `{"type":"hs-server","cert":server_cert,"Y":Y_hex,"sig":sig_S(hs-server transcript)}` |
+| 3 | member → server | `{"type":"hs-member","sig":sig_M(hs-member transcript)}` |
+| 4 | server → member | `{"type":"hs-ok"}` — or `{"type":"hs-error","error":str}` at any step, then close |
+
+- `X_hex` / `Y_hex`: ephemeral P-256 points, uncompressed SEC1, lowercase hex (`"04"‖x‖y`, 130 chars);
+  off-curve or badly encoded points are rejected. Fresh ephemeral keys per connection.
+- The server accepts only certificates for `MEMBER_NAMES`; the member requires the name `server`.
+- Shared secret = raw 32-byte ECDH x-coordinate; `channel.derive_directional_keys` binds it to
+  `["hs", GROUP, name, X_hex, Y_hex]`.
+- Weak mode `unsigned-handshake` omits **both** handshake signatures (no `sig` fields, nothing
+  verified); certificate verification, AES-GCM and signed-request verification stay enabled.
+  A secure peer rejects an unsigned peer.
 
 ## 9. `channel.py` — Member 3
 
@@ -197,6 +216,26 @@ Registration is signed by the member over `["register", GROUP, name, X_M_hex]` u
 `server.py` (Member 2) calls exported functions from `certificates.py`, `requests.py`, `login.py`,
 `opening.py`, `voting.py` — it never copies their logic. `member.py` (Member 3) owns the client flow
 connect → handshake → channel → registration/login → signed requests.
+
+Server behaviour (Member 2, `server.py`):
+
+- One thread per connection: `server_handshake` → `SecureChannel.from_session(ctx, "server")` →
+  dispatch loop. Any refusal is answered with `ok: false` and the connection is closed (fail closed).
+- Registration: strict hex `X_M`, `group.is_valid_element`, signature checked with the key from the
+  member's certificate over `["register", GROUP, certified_name, X_M_hex]`. The first `X_M` per name
+  is kept; the same value again → `status: "already-registered"`; a different one is rejected.
+- Interactive login: `login.generate_challenge(weak="short-challenge" in weak)`. Non-interactive:
+  `secrets.token_bytes(16).hex()` nonce, valid only for the next `login-proof` on that session and
+  consumed before verification.
+- Requests: only after login; `request.name` must equal the certified name; `verify_request` and the
+  sequence advance happen atomically under one lock, so concurrent sessions cannot reuse a `seq`.
+- State files (lock + temp file + `os.replace`): `server/registrations.json` `{name: X_M_hex}` and
+  `server/sequences.json` `{name: last_seq}` (replay protection survives restarts).
+- `--weak` is repeatable: `unsigned-handshake` (A1), `short-challenge` (A3), `no-encryption` (capture).
+
+Mallory (Member 2, `mallory.py`): `--attack A1 --weak unsigned-handshake [--tamper modify|replay]`
+listens on `MALLORY_PORT`, replaces `X`/`Y` with her own keys, keeps two channels and logs every
+plaintext message. `attacks/a1_unsigned_handshake.py` runs the full scripted demo in a temp directory.
 
 Member files: `runtime/data/<name>/private.pem`, `login_secret.json` (`x_M`, `X_M`, `registered`),
 `state.json` (`last_seq`). `member --init` writes the key, the public request and the login secret.
