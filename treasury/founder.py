@@ -50,6 +50,11 @@ CERTS_DIR = DATA_DIR / "certs"
 M2_DIR = DATA_DIR / "m2"
 GENERATIONS_DIR = M2_DIR / "generations"
 CURRENT_FILE = M2_DIR / "current.json"
+
+
+def member_share_path(name: str):
+    """Private share file owned by one member; no other program reads it."""
+    return DATA_DIR / name / "share.json"
 VAULT_VERSION = 1
 VAULT_PLAINTEXT = b"Treasury vault: the club's treasure is protected by 3-of-5 shares.\n"
 
@@ -174,6 +179,26 @@ def _next_generation(force: bool) -> tuple[str, object, object]:
     return name, final, staging
 
 
+def _publish_shares(generation: str, shares: list[int]) -> None:
+    """Hand each share to its member's own private directory, one file per member.
+
+    No program should open another member's share file. The ``generation`` field
+    lets a member ignore a share that does not match the published generation.
+    """
+    staged = []
+    for index, share in enumerate(shares, start=1):
+        path = member_share_path(f"M{index}")
+        next_path = path.with_name(path.name + ".next")
+        _write_json(next_path, {
+            "index": index,
+            "generation": generation,
+            "s_i": hex_element(share),
+        }, private=True)
+        staged.append((next_path, path))
+    for next_path, path in staged:
+        os.replace(next_path, path)
+
+
 def setup_vault(log, t: int = DEFAULT_T, n: int = DEFAULT_N, force: bool = False) -> None:
     """Generate shares, signed commitments and the encrypted vault atomically."""
     if not (1 <= t <= n):
@@ -222,9 +247,8 @@ def setup_vault(log, t: int = DEFAULT_T, n: int = DEFAULT_N, force: bool = False
     try:
         public_dir = staging / "public"
         public_dir.mkdir(parents=True, exist_ok=True)
-        for index, share in enumerate(shares, start=1):
-            _write_json(staging / f"M{index}" / "share.json",
-                        {"index": index, "s_i": hex_element(share)}, private=True)
+        # Private shares are NOT published in the generation directory: each
+        # member receives only its own file (see _publish_shares below).
         _write_json(public_dir / "commitments.json", {
             "group": GROUP, "t": t, "n": n, "commitments": C_hexes,
             "digest": D_C, "sig": commitments_sig,
@@ -257,6 +281,7 @@ def setup_vault(log, t: int = DEFAULT_T, n: int = DEFAULT_N, force: bool = False
         if staging.exists():
             shutil.rmtree(staging)
 
+    _publish_shares(generation, shares)
     _write_json(CURRENT_FILE, {
         "generation": generation, "group": GROUP, "t": t, "n": n,
         "commitments_digest": D_C,
