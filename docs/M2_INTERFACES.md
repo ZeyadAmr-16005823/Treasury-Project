@@ -135,24 +135,33 @@ runtime/data/m2/
         vault.json
         vault.enc
         manifest.json          # written LAST: generation id, t, n, D_C, artifact digests
-      M1/share.json
-      M2/share.json
-      M3/share.json
-      M4/share.json
-      M5/share.json
   current.json                 # atomically updated pointer to the active generation
-```
-`share.json = {"index": i, "s_i": "<512hex>"}`, private key file permissions on POSIX, never logged.
-This tree is separate from M1 certificates and registrations.
 
-**Atomic publication:** build everything in `generation-NNN.tmp` on the same filesystem, validate
-shares + signatures + vault decryption there, then **one** directory rename to `generation-NNN`,
-write `manifest.json` last (or rename a prebuilt complete directory), then atomically update
-`current.json`. Consumers ignore any generation without `manifest.json`. Never overwrite an
-existing completed generation. Without `--force`, setup refuses if one exists; **with `--force`, a new
-immutable generation is created** (`generation-002`, etc.) and `current.json` is changed only after the
-new generation is complete and validated. Previous generations and their shares are never deleted or
-modified. An interrupted forced setup leaves the previous `current.json` pointer untouched.
+runtime/data/M1/share.json     # private to M1, never read by another program
+runtime/data/M2/share.json
+runtime/data/M3/share.json
+runtime/data/M4/share.json
+runtime/data/M5/share.json
+```
+
+**Private-share handoff.** The founder generates all five shares but publishes **only public data**
+in the generation directory. Each share is written into the corresponding member's own private
+directory (`runtime/data/M<i>/share.json`), standing for an in-person handover. A member reads only
+its own `share.json`; the server and Mallory never read share files. 0600 permissions on POSIX are
+defence in depth, but since all programs may run as the same OS user, the real isolation is the
+application rule: **no program opens another program's private directory**. Each share file is
+`{"index": i, "generation": "generation-NNN", "s_i": "<512hex>"}`; a member uses it only when its
+`generation` matches `current.json`.
+
+**Atomic publication:** build the public artifacts in `generation-NNN.tmp` on the same filesystem,
+validate shares + signatures + vault decryption there, write `manifest.json` last, hand the shares
+to the member directories, then **one** directory rename to `generation-NNN`, and finally atomically
+update `current.json`. Consumers ignore any generation without `manifest.json` and any share whose
+`generation` differs from `current.json`. Never overwrite an existing completed generation.
+Without `--force`, setup refuses if one exists; **with `--force`, a new immutable generation is
+created** (`generation-002`, etc.) and `current.json` is changed only after the new generation is
+complete and validated. Previous generations are never deleted or modified; an interrupted forced
+setup leaves the previous `current.json` pointer untouched.
 
 ## 8. Erasure
 
