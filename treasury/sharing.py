@@ -2,7 +2,8 @@
 
 All group elements and scalars are encoded as fixed-width lowercase hex without
 ``0x``. ``GROUP`` is bound into the vault transcript and the founder signatures.
-See docs/M2_INTERFACES.md for the frozen byte-level contract.
+See docs/M2_INTERFACES.md for the proposed byte-level contract, pending
+cross-member approval.
 """
 import secrets
 
@@ -11,7 +12,7 @@ from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
 from .config import GROUP
 from .encoding import canonical_json, sha256
-from .group import P
+from .group import P, is_valid_element
 
 GROUP_ELEMENT_BYTES = (P.bit_length() + 7) // 8
 HEX_WIDTH = GROUP_ELEMENT_BYTES * 2  # 512 characters for the 2048-bit group
@@ -20,21 +21,6 @@ DIGEST_HEX_WIDTH = 64
 
 def _is_int(value) -> bool:
     return isinstance(value, int) and not isinstance(value, bool)
-
-
-def is_subgroup_element(u: int, p: int, q: int, *, allow_identity: bool = False) -> bool:
-    """Relaxed subgroup check: identity is permitted only when explicitly allowed.
-
-    This is a local helper so Member 1 does not edit Member 4's ``group.py``.
-    Member 4 may later provide a shared equivalent; until then importers use this.
-    """
-    if not all(_is_int(v) for v in (u, p, q)) or p < 3 or q < 3:
-        return False
-    if not (1 <= u < p):
-        return False
-    if not allow_identity and u == 1:
-        return False
-    return pow(u, q, p) == 1
 
 
 def random_nonzero_scalar(q: int) -> int:
@@ -91,22 +77,24 @@ def make_commitments(coefficients: list[int], p: int, q: int, g: int) -> list[in
 
 def verify_share(share: int, member_index: int, commitments: list[int],
                  p: int, q: int, g: int) -> bool:
-    """Check g^{s_i} == product(C_k^{i^k}) mod p, with M2 validation rules."""
+    """Check g^{s_i} == product(C_k^{i^k}) mod p with strict commitments.
+
+    The starter signature has no ``n`` or ``t`` parameter, so this helper
+    cannot enforce ``member_index <= n`` or ``len(commitments) == t``. Those
+    two checks, plus binding the index to a certified identity, belong to the
+    calling program. See docs/M2_INTERFACES.md §4 for the responsibility split.
+    """
     if not all(_is_int(v) for v in (share, member_index, p, q, g)):
         return False
-    if member_index < 1 or not 0 <= share < q:
+    if member_index < 1 or not 0 < share < q:
         return False
     if not isinstance(commitments, (list, tuple)) or not commitments:
         return False
     if not all(_is_int(c) for c in commitments):
         return False
-    if not all(1 <= c < p for c in commitments):
-        return False
-    # C_0 = g^s and s is nonzero; later commitments may be the identity.
-    if commitments[0] == 1:
-        return False
-    if not all(is_subgroup_element(c, p, q, allow_identity=(k > 0))
-               for k, c in enumerate(commitments)):
+    # Strict boundary validation: every published commitment must be a
+    # non-identity element of the order-q subgroup (group.py's validator).
+    if not all(is_valid_element(c) for c in commitments):
         return False
     right = 1
     for k, commitment in enumerate(commitments):
@@ -167,9 +155,20 @@ def vault_aad(c1_hex: str, c2_hex: str, D_C: str) -> bytes:
 
 
 def vault_key(m: int, c1_hex: str, c2_hex: str, D_C: str) -> bytes:
-    """HKDF-SHA256 derive the 32-byte vault key from the recovered group element m."""
-    if not _is_int(m) or not 1 <= m < P:
-        raise ValueError("m must be a non-identity group element modulo P")
+    """HKDF-SHA256 derive the 32-byte vault key from the recovered group element m.
+
+    Strict group validation is applied to all three protocol inputs: m, c1 and
+    c2 must be non-identity elements of the order-q subgroup accepted by
+    ``group.is_valid_element``. The starter call signature is unchanged; only
+    the validation contract is tightened.
+    """
+    if not is_valid_element(m):
+        raise ValueError("m must be a strict non-identity group element")
+    for label, value in (("c1_hex", c1_hex), ("c2_hex", c2_hex)):
+        _check_hex(value, HEX_WIDTH, label)
+        if not is_valid_element(int(value, 16)):
+            raise ValueError(f"{label} must be a strict non-identity group element")
+    _check_hex(D_C, DIGEST_HEX_WIDTH, "D_C")
     info = b"ICS505|" + GROUP.encode("ascii") + b"|vault|" + sha256(
         vault_transcript(c1_hex, c2_hex, D_C)
     )

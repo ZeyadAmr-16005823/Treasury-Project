@@ -7,6 +7,10 @@ encrypted vault, publishing a complete generation atomically.
 The founder never reads another program's private key. All founder-only secrets
 (s, polynomial coefficients, u, r, m and the derived key K) are used in memory
 only and are never written to disk or logged.
+
+M2 candidate setup uses rejection sampling: a candidate that would publish an
+identity group element or a zero share is discarded and regenerated before any
+artifact is written (see docs/M2_INTERFACES.md §4).
 """
 import argparse
 import json
@@ -28,7 +32,7 @@ from .crypto_utils import (
     sign_raw,
 )
 from .encoding import canonical_json, sha256
-from .group import G, P, Q
+from .group import G, P, Q, is_valid_element
 from .logging_utils import get_logger
 from .sharing import (
     hex_element,
@@ -47,9 +51,11 @@ FOUNDER_PUBLIC = DATA_DIR / "founder.pub"
 REQUESTS_DIR = DATA_DIR / "requests"
 CERTS_DIR = DATA_DIR / "certs"
 
-M2_DIR = DATA_DIR / "m2"
-GENERATIONS_DIR = M2_DIR / "generations"
-CURRENT_FILE = M2_DIR / "current.json"
+# "vault" (not "m2") avoids a case-insensitive collision with member M2's own
+# directory on Windows/macOS: m2 and M2 would otherwise be the same directory.
+VAULT_DIR = DATA_DIR / "vault"
+GENERATIONS_DIR = VAULT_DIR / "generations"
+CURRENT_FILE = VAULT_DIR / "current.json"
 
 
 def member_share_path(name: str, generation: str):
@@ -58,8 +64,12 @@ def member_share_path(name: str, generation: str):
 
 
 def member_share_staging_path(name: str, generation: str):
+    """Versioned temp directory for one member's next private share."""
     return DATA_DIR / name / "m2" / "generations" / f"{generation}.tmp"
+
+
 VAULT_VERSION = 1
+MAX_SETUP_ATTEMPTS = 32  # rejection sampling for degenerate candidates
 VAULT_PLAINTEXT = b"Treasury vault: the club's treasure is protected by 3-of-5 shares.\n"
 
 
@@ -183,6 +193,34 @@ def _next_generation(force: bool) -> tuple[str, object, object]:
     return name, final, staging
 
 
+def _candidate_is_valid(commitments: list[int], shares: list[int], m: int,
+                        c1: int, c2: int, c1_hex: str, c2_hex: str,
+                        D_C: str, t: int, n: int) -> bool:
+    """Return False for a candidate that must be discarded before publication.
+
+    Rejection rules: every published group element (commitments, m, c1, c2) is
+    strict/non-identity, and no member share is zero (which would make h_i=1).
+    Length checks are explicit caller checks in ``setup_vault``; they are
+    repeated here defensively. ``verify_share`` itself cannot see n or t.
+    """
+    if len(commitments) != t or len(shares) != n:
+        return False
+    if not all(is_valid_element(c) for c in commitments):
+        return False
+    if not all(0 < share < Q for share in shares):
+        return False
+    for index, share in enumerate(shares, start=1):
+        if not verify_share(share, index, commitments, P, Q, G):
+            return False
+    if not all(is_valid_element(value) for value in (m, c1, c2)):
+        return False
+    try:
+        vault_key(m, c1_hex, c2_hex, D_C)
+    except ValueError:
+        return False
+    return True
+
+
 def _stage_shares(generation: str, shares: list[int]) -> None:
     """Stage each share in its member's versioned temp directory.
 
@@ -222,25 +260,33 @@ def setup_vault(log, t: int = DEFAULT_T, n: int = DEFAULT_N, force: bool = False
         raise RuntimeError("founder CA key is missing; run with --init first")
     founder_private_key = load_private_key(FOUNDER_PRIVATE)
 
-    # Founder-only secrets: never written to disk or logged.
-    s = random_nonzero_scalar(Q)
-    coefficients, shares = make_shares(s, t, n, Q)
-    commitments = make_commitments(coefficients, P, Q, G)
-    C_hexes = [hex_element(c) for c in commitments]
-    commitments_bytes = _commitments_bytes(t, n, C_hexes)
-    D_C = sha256(commitments_bytes).hex()
+    # Founder-only secrets: never written to disk or logged. A candidate that
+    # would publish an identity element or a zero share is discarded and a new
+    # polynomial/ciphertext is generated before anything is written.
+    for _attempt in range(MAX_SETUP_ATTEMPTS):
+        s = random_nonzero_scalar(Q)
+        coefficients, shares = make_shares(s, t, n, Q)
+        if len(shares) != n:
+            raise RuntimeError("share count does not match n")
+        commitments = make_commitments(coefficients, P, Q, G)
+        if len(commitments) != t:
+            raise RuntimeError("commitment count does not match t")
+        C_hexes = [hex_element(c) for c in commitments]
+        commitments_bytes = _commitments_bytes(t, n, C_hexes)
+        D_C = sha256(commitments_bytes).hex()
+        u = random_nonzero_scalar(Q)
+        m = pow(G, u, P)
+        r = random_nonzero_scalar(Q)
+        c1 = pow(G, r, P)
+        c2 = m * pow(commitments[0], r, P) % P
+        c1_hex, c2_hex = hex_element(c1), hex_element(c2)
+        if _candidate_is_valid(commitments, shares, m, c1, c2,
+                               c1_hex, c2_hex, D_C, t, n):
+            break
+    else:
+        raise RuntimeError("could not generate a valid vault candidate")
+
     commitments_sig = sign_raw(founder_private_key, commitments_bytes)
-
-    for index, share in enumerate(shares, start=1):
-        if not verify_share(share, index, commitments, P, Q, G):
-            raise RuntimeError(f"generated share for M{index} failed verification")
-
-    u = random_nonzero_scalar(Q)
-    m = pow(G, u, P)
-    r = random_nonzero_scalar(Q)
-    c1 = pow(G, r, P)
-    c2 = m * pow(commitments[0], r, P) % P
-    c1_hex, c2_hex = hex_element(c1), hex_element(c2)
     key = vault_key(m, c1_hex, c2_hex, D_C)
     aad = vault_aad(c1_hex, c2_hex, D_C)
     nonce = (0).to_bytes(12, "big")  # vault frame counter starts at 0
@@ -264,7 +310,7 @@ def setup_vault(log, t: int = DEFAULT_T, n: int = DEFAULT_N, force: bool = False
         public_dir = staging / "public"
         public_dir.mkdir(parents=True, exist_ok=True)
         # Private shares are NOT published in the generation directory: each
-        # member receives only its own file (see _publish_shares below).
+        # member receives only its own versioned file (see _stage_shares).
         _write_json(public_dir / "commitments.json", {
             "group": GROUP, "t": t, "n": n, "commitments": C_hexes,
             "digest": D_C, "sig": commitments_sig,
@@ -285,7 +331,9 @@ def setup_vault(log, t: int = DEFAULT_T, n: int = DEFAULT_N, force: bool = False
             raise RuntimeError("vault self-check failed; nothing was published")
 
         digests = {
-            str(path.relative_to(staging)): _sha256_file(path)
+            # POSIX separators; keys are relative to the generation root and
+            # never absolute, so consumers on any OS resolve them identically.
+            path.relative_to(staging).as_posix(): _sha256_file(path)
             for path in sorted(staging.rglob("*")) if path.is_file()
         }
         _write_json(staging / "manifest.json", {
@@ -337,7 +385,7 @@ def main() -> None:
     parser.add_argument("--setup-vault", action="store_true",
                         help="generate shares, commitments and the encrypted vault")
     parser.add_argument("--force", action="store_true",
-                        help="with --setup-vault: allow replacing an existing generation")
+                        help="with --setup-vault: publish a new immutable generation; never overwrite")
     args = parser.parse_args()
     validate_group()
     log = get_logger("founder")

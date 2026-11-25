@@ -7,12 +7,12 @@ from unittest.mock import Mock, patch
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-from treasury import founder
+from treasury import founder, member
 from treasury.config import GROUP
 from treasury.crypto_utils import load_public_key, verify_raw
 from treasury.encoding import canonical_json, sha256
-from treasury.group import G, P, Q
-from treasury.sharing import lagrange_coefficient, verify_share, vault_aad, vault_key
+from treasury.group import G, P, Q, is_valid_element
+from treasury.sharing import evaluate_polynomial, hex_element, lagrange_coefficient, verify_share, vault_aad, vault_key
 
 
 class FounderVaultTests(unittest.TestCase):
@@ -25,9 +25,9 @@ class FounderVaultTests(unittest.TestCase):
             patch.object(founder, "FOUNDER_DIR", root / "founder"),
             patch.object(founder, "FOUNDER_PRIVATE", root / "founder" / "founder_private.pem"),
             patch.object(founder, "FOUNDER_PUBLIC", root / "founder.pub"),
-            patch.object(founder, "M2_DIR", root / "m2"),
-            patch.object(founder, "GENERATIONS_DIR", root / "m2" / "generations"),
-            patch.object(founder, "CURRENT_FILE", root / "m2" / "current.json"),
+            patch.object(founder, "VAULT_DIR", root / "vault"),
+            patch.object(founder, "GENERATIONS_DIR", root / "vault" / "generations"),
+            patch.object(founder, "CURRENT_FILE", root / "vault" / "current.json"),
         ]
         for item in patches:
             item.start()
@@ -46,6 +46,16 @@ class FounderVaultTests(unittest.TestCase):
         self.assertEqual((current["t"], current["n"], current["group"]), (3, 5, GROUP))
         self.assertTrue((generation / "manifest.json").exists())
         self.assertFalse(list(generation.rglob("share.json")))  # no central private copy
+        self.assertFalse(list(founder.VAULT_DIR.rglob("share.json")))  # no share in public tree
+
+        manifest = json.loads((generation / "manifest.json").read_text())
+        self.assertEqual(manifest["generation"], current["generation"])
+        self.assertEqual(manifest["commitments_digest"], current["commitments_digest"])
+        self.assertIn("public/vault.json", manifest["artifacts"])
+        self.assertFalse(any("\\" in key for key in manifest["artifacts"]))
+        self.assertFalse(any(Path(key).is_absolute() for key in manifest["artifacts"]))
+        for key, expected in manifest["artifacts"].items():
+            self.assertEqual(expected, sha256((generation / key).read_bytes()).hex())
 
         commitments = json.loads((generation / "public" / "commitments.json").read_text())
         commitments_bytes = canonical_json(
@@ -53,6 +63,7 @@ class FounderVaultTests(unittest.TestCase):
         )
         self.assertEqual(commitments["digest"], sha256(commitments_bytes).hex())
         self.assertTrue(verify_raw(self.founder_public, commitments_bytes, commitments["sig"]))
+        self.assertTrue(all(is_valid_element(int(c, 16)) for c in commitments["commitments"]))
 
         C = [int(value, 16) for value in commitments["commitments"]]
         shares = []
@@ -66,6 +77,8 @@ class FounderVaultTests(unittest.TestCase):
 
         vault = json.loads((generation / "public" / "vault.json").read_text())
         self.assertEqual(vault["commitments_digest"], commitments["digest"])
+        self.assertTrue(is_valid_element(int(vault["c1"], 16)))
+        self.assertTrue(is_valid_element(int(vault["c2"], 16)))
         vault_bytes = canonical_json({k: v for k, v in vault.items() if k != "sig"})
         self.assertTrue(verify_raw(self.founder_public, vault_bytes, vault["sig"]))
 
@@ -75,6 +88,7 @@ class FounderVaultTests(unittest.TestCase):
             d_i = pow(int(vault["c1"], 16), shares[index - 1], P)
             D = D * pow(d_i, lagrange_coefficient(index, selected, Q), P) % P
         m = int(vault["c2"], 16) * pow(D, -1, P) % P
+        self.assertTrue(is_valid_element(m))
         frame = (generation / "public" / "vault.enc").read_bytes()
         key = vault_key(m, vault["c1"], vault["c2"], vault["commitments_digest"])
         aad = vault_aad(vault["c1"], vault["c2"], vault["commitments_digest"])
@@ -86,11 +100,91 @@ class FounderVaultTests(unittest.TestCase):
         _, generation = self.current_generation()
         vault = json.loads((generation / "public" / "vault.json").read_text())
         digest = vault["commitments_digest"]
-        original = vault_key(2, vault["c1"], vault["c2"], digest)
-        changed_c1 = vault["c1"][:-1] + ("0" if vault["c1"][-1] != "0" else "1")
-        changed_c2 = vault["c2"][:-1] + ("0" if vault["c2"][-1] != "0" else "1")
-        self.assertNotEqual(original, vault_key(2, changed_c1, vault["c2"], digest))
-        self.assertNotEqual(original, vault_key(2, vault["c1"], changed_c2, digest))
+        m = pow(G, 2, P)
+        original = vault_key(m, vault["c1"], vault["c2"], digest)
+        # Use other strict subgroup elements: a single hex-digit mutation of a
+        # random group element may leave the subgroup and be (correctly) rejected.
+        changed_c1 = hex_element(pow(int(vault["c1"], 16), 2, P))
+        changed_c2 = hex_element(pow(int(vault["c2"], 16), 2, P))
+        self.assertNotEqual(original, vault_key(m, changed_c1, vault["c2"], digest))
+        self.assertNotEqual(original, vault_key(m, vault["c1"], changed_c2, digest))
+
+    def test_vault_dir_is_distinct_from_member2_dir(self):
+        member2_dir = founder.DATA_DIR / "M2"
+        member2_dir.mkdir(parents=True, exist_ok=True)
+        founder.VAULT_DIR.mkdir(parents=True, exist_ok=True)
+        self.assertFalse(os.path.samefile(member2_dir, founder.VAULT_DIR))
+        self.assertNotEqual(member2_dir.name.lower(), founder.VAULT_DIR.name.lower())
+
+    def test_member2_private_files_are_not_created_inside_vault_dir(self):
+        founder.setup_vault(self.log)
+        with patch.object(member, "DATA_DIR", founder.DATA_DIR):
+            member.init_identity("M2", self.log)
+            key_path = member.private_key_path("M2")
+            secret_path = member.login_secret_path("M2")
+        self.assertTrue(key_path.exists())
+        self.assertTrue(secret_path.exists())
+        self.assertFalse((founder.VAULT_DIR / "private.pem").exists())
+        self.assertFalse((founder.VAULT_DIR / "login_secret.json").exists())
+        self.assertFalse(list(founder.VAULT_DIR.rglob("private.pem")))
+        current, _ = self.current_generation()
+        self.assertTrue(founder.member_share_path("M2", current["generation"]).exists())
+
+    def test_candidate_validation_rules(self):
+        coefficients = [1, 2, 3]
+        commitments = [pow(G, a, P) for a in coefficients]
+        shares = [evaluate_polynomial(coefficients, i, Q) for i in range(1, 4)]
+        m, c1, c2 = pow(G, 2, P), pow(G, 3, P), pow(G, 5, P)
+        c1_hex, c2_hex, digest = hex_element(c1), hex_element(c2), "0" * 64
+
+        self.assertTrue(founder._candidate_is_valid(
+            commitments, shares, m, c1, c2, c1_hex, c2_hex, digest, 3, 3))
+        self.assertFalse(founder._candidate_is_valid(  # c2 = 1
+            commitments, shares, m, c1, 1, c1_hex, hex_element(1), digest, 3, 3))
+        self.assertFalse(founder._candidate_is_valid(  # m = 1
+            commitments, shares, 1, c1, c2, c1_hex, c2_hex, digest, 3, 3))
+        self.assertFalse(founder._candidate_is_valid(  # zero share -> h_i = 1
+            commitments, [0] + shares[1:], m, c1, c2, c1_hex, c2_hex, digest, 3, 3))
+        self.assertFalse(founder._candidate_is_valid(  # identity commitment
+            [commitments[0], 1, commitments[2]], shares, m, c1, c2,
+            c1_hex, c2_hex, digest, 3, 3))
+        self.assertFalse(founder._candidate_is_valid(  # caller-side length checks
+            commitments[:2], shares, m, c1, c2, c1_hex, c2_hex, digest, 3, 3))
+        self.assertFalse(founder._candidate_is_valid(
+            commitments, shares[:2], m, c1, c2, c1_hex, c2_hex, digest, 3, 3))
+
+    def test_degenerate_candidate_is_regenerated_before_publication(self):
+        real_make_shares = founder.make_shares
+        calls = []
+
+        def flaky(secret, t, n, q):
+            calls.append(secret)
+            if len(calls) == 1:
+                # zero higher coefficients (identity C1/C2) and zero shares
+                return [secret, 0, 0], [secret] * n
+            return real_make_shares(secret, t, n, q)
+
+        with patch.object(founder, "make_shares", side_effect=flaky):
+            founder.setup_vault(self.log)
+        self.assertEqual(len(calls), 2)
+        current, generation = self.current_generation()
+        self.assertEqual(current["generation"], "generation-001")
+        commitments = json.loads((generation / "public" / "commitments.json").read_text())
+        self.assertTrue(all(is_valid_element(int(c, 16)) for c in commitments["commitments"]))
+
+    def test_commitment_count_mismatch_publishes_nothing(self):
+        with patch.object(founder, "make_commitments", return_value=[pow(G, 1, P)]):
+            with self.assertRaises(RuntimeError):
+                founder.setup_vault(self.log)
+        self.assertFalse(founder.CURRENT_FILE.exists())
+        self.assertFalse(founder.GENERATIONS_DIR.exists())
+
+    def test_share_count_mismatch_publishes_nothing(self):
+        with patch.object(founder, "make_shares", return_value=([1, 2, 3], [1, 2, 3])):
+            with self.assertRaises(RuntimeError):
+                founder.setup_vault(self.log)
+        self.assertFalse(founder.CURRENT_FILE.exists())
+        self.assertFalse(founder.GENERATIONS_DIR.exists())
 
     def test_regeneration_is_refused_unless_forced(self):
         founder.setup_vault(self.log)
@@ -177,8 +271,16 @@ class FounderVaultTests(unittest.TestCase):
     def test_no_secret_bearing_fields_are_persisted(self):
         # Known founder scalar values let the test check for their persisted forms.
         known_s, known_u, known_r = 12345, 23456, 34567
-        with patch.object(founder, "random_nonzero_scalar",
-                          side_effect=[known_s, known_u, known_r]):
+        real_scalar = founder.random_nonzero_scalar
+        known_values = iter([known_s, known_u, known_r])
+
+        def scalars(q):
+            try:
+                return next(known_values)
+            except StopIteration:
+                return real_scalar(q)
+
+        with patch.object(founder, "random_nonzero_scalar", side_effect=scalars):
             founder.setup_vault(self.log)
         current, generation = self.current_generation()
         vault = json.loads((generation / "public" / "vault.json").read_text())
