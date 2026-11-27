@@ -224,14 +224,80 @@ representations; do not write or log them. Python integers are immutable, so `de
 and cannot guarantee memory scrubbing — documented as such. Tests inspect persistent artifacts for
 unexpected secret-bearing fields; they do not substring-scan binary ciphertext.
 
-## 9. Opening (consumers, not Member 1 implementation)
+## 9. Opening — `opening.py` (Member 3)
 
-Member 3 samples `w ← ℤ_q` and **retries when `w = 0`**, so `T₁=g^w` and `T₂=c₁^w` are strict
-non-identity group elements. It produces `d_i = c₁^{s_i}` (strict) and a proof `(T₁, T₂, e, z)` with
+Member 3 samples `w ← ℤ_q` and **retries when `w = 0`** (implemented as uniform `w ∈ [1, q−1]` via
+`group.random_exponent`), so `T₁=g^w` and `T₂=c₁^w` are strict non-identity group elements. It produces
+`d_i = c₁^{s_i}` (strict) and a proof `(T₁, T₂, e, z)` with
 `e = H("dec", i, c₁, h_i, d_i, T₁, T₂)`, `z = w + e·s_i mod q`.
 Member 2 first checks `1 ≤ i ≤ n`, `len(commitments) == t`, and strict subgroup membership of all
 incoming elements, verifies `g^z = T₁·h_i^e` and `c₁^z = T₂·d_i^e`, accepts `t` valid shares, computes
 `λ_i` with `lagrange_coefficient`, then `D = ∏ d_i^{λ_i}` and `m = c₂·D^{-1}`.
+`threshold_decrypt` below performs exactly these steps, so the server should call it rather than
+re-implementing them.
+
+### 9.1 Exported API
+
+```python
+class OpeningError(ValueError)
+@dataclass DecryptionProof(T1: int, T2: int, e: int, z: int)        # to_dict() / from_dict()
+@dataclass DecryptionShare(index: int, d: int, proof: DecryptionProof | None)  # to_dict() / from_dict()
+
+public_share_key(member_index, commitments, p=P) -> int              # h_i = ∏ C_k^{i^k}
+decryption_challenge(i, c1, h_i, d_i, T1, T2, q=Q) -> int            # H("dec", ...)
+make_decryption_share(share, member_index, c1, h_i=None, *, p, q, g) -> DecryptionShare
+verify_decryption_share(decryption_share, c1, h_i, *, p, q, g) -> bool
+combine_decryption_shares(decryption_shares, q=Q, p=P) -> int        # D over exactly the given shares
+recover_message(c2, D, p=P) -> int                                   # m = c2 · D^{-1}
+threshold_decrypt(c1, c2, commitments, decryption_shares, t, n, *,
+                  verify_proofs=True) -> OpeningResult(m, used, rejected)
+
+load_public_vault(founder_public_key, data_dir=DATA_DIR) -> PublicVault
+load_member_share(name, vault, data_dir=DATA_DIR) -> int             # member-side only
+member_index(name) -> int                                            # "M3" -> 3
+decrypt_vault(m, vault) -> bytes                                     # raises OpeningError on wrong m
+```
+
+- `verify_decryption_share` recomputes `e` and requires it to equal the proof's `e`, requires
+  `0 ≤ z < q`, strict `c₁, h_i, d_i, T₁, T₂`, and both equations. A missing proof (`None`) is rejected.
+- `threshold_decrypt` does the caller checks `verify_share` cannot (`len(commitments) == t`,
+  `1 ≤ i ≤ n`), drops duplicate, out-of-range, non-group and unproven shares (reasons in
+  `rejected`), uses the **first `t` valid shares in index order**, and raises `OpeningError` if fewer
+  than `t` survive. It works for **any** `(c₁, c₂)`; Milestone 3 reuses it on the aggregated ballot.
+- **A5:** `verify_proofs=False` is the only weak path (`--weak no-proof`, server side, Member 2).
+  Shares are then combined without proof checks, so a corrupted `d₃·g` gives a wrong `m` and
+  `decrypt_vault` fails. Secure mode rejects that share and still opens with ≥ `t` honest shares.
+- `load_public_vault` follows `current.json` to a completed generation and checks: `GROUP` in all
+  four files, manifest digests of every artifact, founder signatures on `commitments.json` and
+  `vault.json`, `D_C` identical in all four places, consistent `t`/`n`, `len(commitments) == t`, and
+  strict `C_k`, `c₁`, `c₂`. Both the member and the server can use it.
+- `load_member_share` reads only `runtime/data/<name>/m2/generations/<current>/share.json`, binds the
+  index to the certified name (`Mi → i`), checks `i ≤ n`, the generation and the Feldman equation.
+
+### 9.2 Wire message (member → server)
+
+The decryption share is sent as an ordinary M1 **signed request**, so it is authenticated by the
+member's ECDSA key, protected by the sequence number, and travels inside the AES-GCM channel:
+
+```json
+{"op": "open-share", "seq": <int>, "name": "M3", "sig": "<128hex>",
+ "body": {"generation": "generation-001", "c1": "<512hex>",
+          "index": 3, "d": "<512hex>",
+          "proof": {"T1": "<512hex>", "T2": "<512hex>", "e": "<512hex>", "z": "<512hex>"}}}
+```
+
+Member command: `python -m treasury.member --name M3 --open`. Before sending, the member checks the
+public vault and its own share; `s_i` is never sent or logged.
+
+Server (Member 2) handler for `op == "open-share"` via `TreasuryServer(request_handlers=...)`:
+1. reject if `body["index"] != member_index(session name)`, or `generation` / `c1` do not match the
+   ciphertext being opened;
+2. `DecryptionShare.from_dict({index, d, proof})`, keep at most one share per member;
+3. call `threshold_decrypt(..., verify_proofs="no-proof" not in weak)`; on `OpeningError`, reply
+   with a waiting status; on success call `decrypt_vault(result.m, vault)`.
+
+Any reply fields beyond `type/ok/seq` (e.g. `{"status": "waiting (2/3)"}` or
+`{"status": "opened", "used": [1, 3, 5]}`) are printed by the member as `server reply: …`.
 
 ## 10. Tests
 

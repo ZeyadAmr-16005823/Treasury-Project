@@ -11,6 +11,7 @@ Normal run:
     python -m treasury.member --name M1 --login both          # two sessions, one per method
     python -m treasury.member --name M1 --op spend --body '{"amount": 50, "reason": "pizza"}'
     python -m treasury.member --name M1 --port 6000           # through Mallory (A1)
+    python -m treasury.member --name M3 --open                # M2: send my decryption share
 
 Flow per connection: TCP connect -> signed ECDH handshake (handshake.py) ->
 AES-256-GCM channel (channel.py) -> registration (first time) -> login ->
@@ -32,6 +33,14 @@ Wire messages after the handshake (all inside the encrypted channel):
     request         {"type": "request", "request": {op, seq, body, name, sig}}
                  <- {"type": "request-result", "ok": bool, "seq": int, "error"?: str}
     bye             {"type": "bye"}
+
+Milestone 2 (``--open``): the decryption share travels as a signed request
+    op "open-share", body {"generation": str, "c1": hex512,
+                           "index": int, "d": hex512,
+                           "proof": {"T1": hex512, "T2": hex512, "e": hex512, "z": hex512}}
+Before sending, the member verifies the founder-signed public vault data and
+its own share against the commitments (opening.load_public_vault /
+load_member_share). The share s_i itself is never sent or logged.
 
 Integers (X_M, R, e, z) are lowercase hex without "0x"; the non-interactive
 nonce is passed to login.py verbatim as the hex string the server sent.
@@ -55,7 +64,10 @@ from .framing import ProtocolError
 from .group import G, P, Q, random_exponent
 from .logging_utils import get_logger
 from .login import make_noninteractive_response, register_login_secret
+from .opening import (OpeningError, load_member_share, load_public_vault,
+                      make_decryption_share, public_share_key)
 from .requests import sign_request
+from .sharing import hex_element
 
 LOGIN_MODES = ("interactive", "noninteractive")
 
@@ -264,8 +276,36 @@ def send_request(sock, channel, identity: MemberIdentity, seq: int, op: str, bod
     reply = _expect(recv_secure(sock, channel), "request-result")
     if not reply.get("ok"):
         raise MemberError(f"request seq={seq} refused: {reply.get('error', 'no reason given')}")
-    log.info("request seq=%d op=%s body=%s accepted", seq, op, json.dumps(body, sort_keys=True))
+    shown = body if op != OPEN_OP else {"generation": body.get("generation"), "index": body.get("index")}
+    log.info("request seq=%d op=%s body=%s accepted", seq, op, json.dumps(shown, sort_keys=True))
+    extras = {k: v for k, v in reply.items() if k not in ("type", "ok", "seq")}
+    if extras:
+        log.info("server reply: %s", json.dumps(extras, sort_keys=True))
     return reply
+
+
+# -- Milestone 2: decryption share for threshold opening ----------------------------
+OPEN_OP = "open-share"
+
+
+def build_open_share_body(identity: MemberIdentity, c1: int | None = None, log=None) -> dict:
+    """Check the public vault and this member's share, then build the open-share body.
+
+    ``c1`` defaults to the vault ciphertext; Milestone 3 passes the aggregated
+    ballot's c1 instead. Only d_i and its proof leave the member, never s_i.
+    """
+    vault = load_public_vault(identity.founder_public_key, DATA_DIR)
+    s_i = load_member_share(identity.name, vault, DATA_DIR)
+    index = int(identity.name[1:])
+    target = vault.c1 if c1 is None else c1
+    h_i = public_share_key(index, vault.commitments)
+    share = make_decryption_share(s_i, index, target, h_i)
+    del s_i
+    if log:
+        log.info("%s share for %s verified against the signed commitments; "
+                 "decryption share with proof ready", identity.name, vault.generation)
+    return {"generation": vault.generation, "c1": hex_element(target),
+            **share.to_dict()}
 
 
 def run_session(sock, identity: MemberIdentity, log, *, handshake, login_mode: str = "interactive",
@@ -324,7 +364,10 @@ def run_session(sock, identity: MemberIdentity, log, *, handshake, login_mode: s
 def connect_and_run(args, identity: MemberIdentity, log, login_mode: str) -> None:
     from .handshake import client_handshake  # Member 2's module
 
-    requests = [] if args.op == "none" else [(args.op, args.body)] * args.count
+    if args.open:
+        requests = [(OPEN_OP, build_open_share_body(identity, log=log))]
+    else:
+        requests = [] if args.op == "none" else [(args.op, args.body)] * args.count
     log.info("connecting to %s:%d as %s", args.host, args.port, identity.name)
     with closing(socket.create_connection((args.host, args.port), timeout=SOCKET_TIMEOUT_SECONDS)) as sock:
         run_session(sock, identity, log, handshake=client_handshake, login_mode=login_mode,
@@ -361,6 +404,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--body", type=_parse_body, default={"amount": 50, "reason": "pizza"},
                         help="request body as a JSON object")
     parser.add_argument("--count", type=int, default=1, help="number of requests per session")
+    parser.add_argument("--open", action="store_true",
+                        help="M2: send this member's verified decryption share for the vault")
     return parser
 
 
@@ -381,7 +426,8 @@ def main(argv: list[str] | None = None) -> int:
         modes = LOGIN_MODES if args.login == "both" else (args.login,)
         for mode in modes:
             connect_and_run(args, identity, log, mode)
-    except (MemberError, ChannelError, ProtocolError, ConnectionError, OSError, ValueError) as exc:
+    except (MemberError, OpeningError, ChannelError, ProtocolError, ConnectionError, OSError,
+            ValueError) as exc:
         log.error("connection closed: %s", exc)
         return 1
     except Exception as exc:  # e.g. a handshake/certificate failure raised by handshake.py
